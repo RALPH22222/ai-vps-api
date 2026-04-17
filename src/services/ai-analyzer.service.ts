@@ -1,5 +1,9 @@
 import path from "path";
 import { readFileSync, existsSync } from "fs";
+import { execFile } from "child_process";
+import util from "util";
+
+const execFileAsync = util.promisify(execFile);
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -399,7 +403,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
       issues: [
         "Cannot detect proposal content. Please try again.",
         "",
-        "Your PDF must follow the standard VAWC Capsule Proposal format:",
+        "Your PDF must follow the standard DOST Form No.1B format:",
         "",
         "Required sections:",
         "  ✓ Project Title: [Your project title here]",
@@ -413,10 +417,10 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
         "  • Document structure doesn't match template",
         "  • File is corrupted or password-protected",
         "",
-        "📄 Reference format: VAWC_CapsuleProposal-updated.pdf"
+        "Reference format: DOST Form No.1B"
       ],
       suggestions: [
-        "Use the official VAWC Capsule Proposal template",
+        "Use the official DOST Form No.1B template",
         "Ensure 'Project Title:' label is present in the document",
         "If using a scanned PDF, apply OCR (Optical Character Recognition)",
         "Check that the PDF contains extractable text (not just images)",
@@ -497,11 +501,29 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   ];
   const scaledMeta = scaleMetadata(rawMeta);
 
-  // Encode title to 128-dim memory-efficient Keras embedded semantic vector
-  const titleVec = await encodeTitle(extracted.title);
-
-  // AI Score (0-100) — full neural network forward pass (7 Layers)
-  const score = Math.round(predict(titleVec, scaledMeta));
+  // Call python script for accurate semantic encoding and keras model prediction
+  let score = 65;
+  try {
+    const pyPath = path.resolve(process.cwd(), "trained-ai", "predict_score.py");
+    const { stdout } = await execFileAsync("python", [
+      pyPath,
+      extracted.title,
+      String(extracted.duration),
+      String(extracted.mooe),
+      String(extracted.ps),
+      String(extracted.co),
+      String(extracted.total),
+      String(extracted.cooperating_agencies)
+    ]);
+    const result = JSON.parse(stdout);
+    if (result.score !== undefined) {
+      score = result.score;
+    } else {
+      console.warn("Python prediction returned error:", result.error);
+    }
+  } catch (err) {
+    console.error("Python prediction failed:", err);
+  }
 
   // Cluster profile
   const profile = classify(scaledMeta);
@@ -553,6 +575,16 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   const titleLower = extracted.title.toLowerCase();
   if (titleLower.includes("purchase") || titleLower.includes("procurement")) {
     issues.push("Feasibility alert: Proposal sounds more like a procurement request than a scientific research project.");
+    
+    // Generate a better sounding title
+    const replacedTitle = extracted.title.replace(/purchase of|procurement of/gi, "Integration of").replace(/purchase|procurement/gi, "Development");
+    suggestions.push(`💡 Title Suggestion: "${replacedTitle} for Institutional Advancement" (Shift focus from buying to researching)`);
+  } else if (extracted.title.length > 5 && extracted.title.length < 40) {
+    // If the title is too short, suggest a more academic phrasing
+    suggestions.push(`💡 Title Suggestion: "Comprehensive Study and Optimization of ${extracted.title}"`);
+  } else if (profile !== "Standard R&D Project" && profile !== "Unknown") {
+    // Suggest adding the profile to the title if it's unique
+    suggestions.push(`💡 Title Suggestion: "${extracted.title}: A ${profile} Initiative"`);
   }
 
   const similarPapers: { title: string; year: string }[] = [];
