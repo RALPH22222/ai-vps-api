@@ -28,9 +28,8 @@ interface KMeansParams {
   descriptions: Record<string, string>;
 }
 
-interface ComparisonDB {
-  titles: string[];
-  vectors: number[][];
+interface NSFAward {
+  title: string;
 }
 
 export interface AnalysisResult {
@@ -69,7 +68,7 @@ function loadJSON<T>(filename: string): T {
 let _denseLayers: DenseLayerWeights[] | null = null;
 let _scaler: ScalerParams | null = null;
 let _kmeans: KMeansParams | null = null;
-let _comparisonDB: ComparisonDB | null = null;
+let _nsfAwards: NSFAward[] | null = null;
 let _vocab: Record<string, number> | null = null;
 let _embeddings: Record<string, number[]> | null = null;
 
@@ -88,9 +87,36 @@ function getKMeans(): KMeansParams {
   return _kmeans;
 }
 
-function getComparisonDB(): ComparisonDB {
-  if (!_comparisonDB) _comparisonDB = loadJSON<ComparisonDB>("comparison_db.json");
-  return _comparisonDB;
+function getNSFAwards(): NSFAward[] {
+  if (!_nsfAwards) {
+    try {
+      const csvPath = path.resolve(process.cwd(), "trained-ai", "NSF_Award_Search_cleaned.csv");
+      const content = readFileSync(csvPath, "utf-8");
+      const lines = content.split(/\r?\n/);
+      _nsfAwards = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        
+        let title = "";
+        if (line.startsWith('"')) {
+           const endQuoteIdx = line.indexOf('",');
+           if (endQuoteIdx !== -1) {
+              title = line.substring(1, endQuoteIdx);
+           } else {
+              title = line.substring(1, line.length - 1);
+           }
+        } else {
+           title = line.split(',')[0];
+        }
+        if (title) _nsfAwards.push({ title });
+      }
+    } catch (e) {
+      console.error("Failed to load NSF CSV", e);
+      _nsfAwards = [];
+    }
+  }
+  return _nsfAwards;
 }
 
 function getVocabDB(): Record<string, number> {
@@ -296,30 +322,60 @@ function classify(scaledMeta: number[]): string {
   return kmeans.descriptions[String(bestCluster)] ?? "Unknown";
 }
 
+function getTermFrequencies(words: string[]): Record<string, number> {
+  const freqs: Record<string, number> = {};
+  for (const w of words) {
+    freqs[w] = (freqs[w] || 0) + 1;
+  }
+  return freqs;
+}
+
+function textCosineSimilarity(text1: string, text2: string): number {
+  const words1 = tokenize(text1);
+  const words2 = tokenize(text2);
+  const tf1 = getTermFrequencies(words1);
+  const tf2 = getTermFrequencies(words2);
+  
+  let dot = 0;
+  let norm1 = 0;
+  let norm2 = 0;
+  
+  for (const count of Object.values(tf1)) norm1 += count * count;
+  for (const count of Object.values(tf2)) norm2 += count * count;
+  
+  if (norm1 === 0 || norm2 === 0) return 0;
+  
+  for (const [w, count] of Object.entries(tf1)) {
+    if (tf2[w]) dot += count * tf2[w];
+  }
+  
+  return dot / (Math.sqrt(norm1) * Math.sqrt(norm2));
+}
+
 /**
- * Novelty check via cosine similarity against precomputed DB titles.
+ * Novelty check via text cosine similarity against NSF Award DB.
  */
-function checkUniqueness(titleVec: number[]): {
+function checkUniqueness(title: string): {
   noveltyScore: number;
   bestMatchTitle: string;
   bestMatchSimilarity: number;
 } {
-  const db = getComparisonDB();
-  let bestIdx = 0;
+  const awards = getNSFAwards();
+  let bestTitle = "Unknown";
   let maxSim = -1;
 
-  for (let i = 0; i < db.vectors.length; i++) {
-    const sim = cosineSimilarity(titleVec, db.vectors[i]);
+  for (const award of awards) {
+    const sim = textCosineSimilarity(title, award.title);
     if (sim > maxSim) {
       maxSim = sim;
-      bestIdx = i;
+      bestTitle = award.title;
     }
   }
 
   return {
-    noveltyScore: Math.round((1 - maxSim) * 100),
-    bestMatchTitle: db.titles[bestIdx] ?? "Unknown",
-    bestMatchSimilarity: maxSim === -1 ? 0 : maxSim,
+    noveltyScore: Math.round((1 - Math.max(0, maxSim)) * 100),
+    bestMatchTitle: bestTitle,
+    bestMatchSimilarity: Math.max(0, maxSim),
   };
 }
 
@@ -450,8 +506,8 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   // Cluster profile
   const profile = classify(scaledMeta);
 
-  // Novelty / uniqueness check (cosine similarity against comparison DB)
-  const { noveltyScore, bestMatchTitle, bestMatchSimilarity } = checkUniqueness(titleVec);
+  // Novelty / uniqueness check (cosine similarity against NSF CSV)
+  const { noveltyScore, bestMatchTitle, bestMatchSimilarity } = checkUniqueness(extracted.title);
 
   const issues: string[] = [];
   const suggestions: string[] = [];
