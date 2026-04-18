@@ -7,21 +7,6 @@ const execFileAsync = util.promisify(execFile);
 
 // ── Types ────────────────────────────────────────────────────────────
 
-interface DenseLayerWeights {
-  name: string;
-  kernel: number[][]; // shape: [inputDim, outputDim]
-  bias: number[];
-  activation: string;
-}
-
-interface BatchNormParams {
-  gamma: number[];
-  beta: number[];
-  moving_mean: number[];
-  moving_variance: number[];
-  epsilon: number;
-}
-
 interface ScalerParams {
   mean: number[];
   scale: number[];
@@ -69,17 +54,9 @@ function loadJSON<T>(filename: string): T {
 }
 
 // Lazy-loaded singletons (JSON-based models)
-let _denseLayers: DenseLayerWeights[] | null = null;
 let _scaler: ScalerParams | null = null;
 let _kmeans: KMeansParams | null = null;
 let _nsfAwards: NSFAward[] | null = null;
-let _vocab: Record<string, number> | null = null;
-let _embeddings: Record<string, number[]> | null = null;
-
-function getDenseLayers(): DenseLayerWeights[] {
-  if (!_denseLayers) _denseLayers = loadJSON<DenseLayerWeights[]>("dense_layers.json");
-  return _denseLayers;
-}
 
 function getScaler(): ScalerParams {
   if (!_scaler) _scaler = loadJSON<ScalerParams>("scaler.json");
@@ -123,27 +100,7 @@ function getNSFAwards(): NSFAward[] {
   return _nsfAwards;
 }
 
-function getVocabDB(): Record<string, number> {
-  if (!_vocab) {
-    try {
-      _vocab = loadJSON<Record<string, number>>("vocab.json");
-    } catch (e) {
-      _vocab = {};
-    }
-  }
-  return _vocab;
-}
 
-function getEmbeddingDB(): Record<string, number[]> {
-  if (!_embeddings) {
-    try {
-      _embeddings = loadJSON<Record<string, number[]>>("embedding.json");
-    } catch (e) {
-      _embeddings = {};
-    }
-  }
-  return _embeddings;
-}
 
 // ── Fast Local Text Encoder (replaces ONNX/HuggingFace) ──────────────
 // A pure-JS implementation of Keras AveragePooling Embedding layer to map
@@ -167,80 +124,11 @@ function tokenize(text: string): string[] {
     .filter(w => w.length > 2 && !stops.has(w));
 }
 
-async function encodeTitle(title: string): Promise<number[]> {
-  const vocab = getVocabDB();
-  const embeddings = getEmbeddingDB();
-  const words = tokenize(title);
 
-  const vec = new Array(128).fill(0);
-  let count = 0;
-
-  for (const w of words) {
-    if (vocab[w] !== undefined) {
-      const idx = vocab[w];
-      const emb = embeddings[String(idx)];
-      if (emb) {
-        for (let i = 0; i < 128; i++) vec[i] += emb[i];
-        count++;
-      }
-    }
-  }
-
-  // Average pooling pooling: "mean"
-  if (count > 0) {
-    for (let i = 0; i < 128; i++) vec[i] /= count;
-  }
-
-  return vec;
-}
 
 // ── Math primitives ──────────────────────────────────────────────────
 
-function relu(x: number): number {
-  return x > 0 ? x : 0;
-}
 
-function sigmoid(x: number): number {
-  return 1 / (1 + Math.exp(-x));
-}
-
-/** Matrix-vector multiply: result[j] = sum_i(input[i] * kernel[i][j]) + bias[j] */
-function denseForward(input: number[], kernel: number[][], bias: number[], activation: string): number[] {
-  const outputDim = bias.length;
-  const result = new Array<number>(outputDim);
-
-  for (let j = 0; j < outputDim; j++) {
-    let sum = bias[j];
-    for (let i = 0; i < input.length; i++) {
-      sum += input[i] * kernel[i][j];
-    }
-
-    if (activation === "relu") {
-      result[j] = relu(sum);
-    } else if (activation === "sigmoid") {
-      result[j] = sigmoid(sum);
-    } else {
-      result[j] = sum; // linear
-    }
-  }
-
-  return result;
-}
-
-/** Cosine similarity between two vectors */
-function cosineSimilarity(a: number[], b: number[]): number {
-  const len = Math.min(a.length, b.length);
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < len; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  return denom === 0 ? 0 : dot / denom;
-}
 
 /** Euclidean distance between two vectors */
 function euclideanDistance(a: number[], b: number[]): number {
@@ -265,46 +153,7 @@ function scaleMetadata(raw: number[]): number[] {
 /**
  * Full model forward pass. Returns score 0-100.
  */
-function predict(titleVec: number[], scaledMeta: number[]): number {
-  try {
-    const layers = getDenseLayers();
 
-    // Map the 7 explicitly found layers from Python Keras config
-    const metaLayer1 = layers.find(l => l.name === "meta_dense_1")!;
-    const textLayer1 = layers.find(l => l.name === "text_dense_1")!;
-    const textLayerFinal = layers.find(l => l.name === "text_dense_final")!;
-    const metaLayerFinal = layers.find(l => l.name === "meta_dense_final")!;
-    const shared1 = layers.find(l => l.name === "shared_dense_1" || l.name === "dense_2" || l.kernel.length === 96)!;
-    const shared2 = layers.find(l => l.name === "shared_dense_2" || l.name === "dense_3" || l.kernel.length === 64)!;
-    const outputLayer = layers.find(l => l.name === "output_layer" || l.name === "output" || l.kernel[0].length === 1)!;
-
-    // 1. Text Branch (128 -> 128 -> 64)
-    let x1 = denseForward(titleVec, textLayer1.kernel, textLayer1.bias, textLayer1.activation);
-    x1 = denseForward(x1, textLayerFinal.kernel, textLayerFinal.bias, textLayerFinal.activation);
-
-    // 2. Meta Branch (6 -> 64 -> 32)
-    let x2 = denseForward(scaledMeta, metaLayer1.kernel, metaLayer1.bias, metaLayer1.activation);
-    x2 = denseForward(x2, metaLayerFinal.kernel, metaLayerFinal.bias, metaLayerFinal.activation);
-
-    // 3. Shared Branch: concat(64, 32) -> Dense(64) -> Dense(32) -> Dense(1)
-    const combined = [...x1, ...x2];
-    
-    // Safety check for concatenation dimension
-    if (combined.length !== shared1.kernel.length) {
-       console.warn(`Shape mismatch in concat: got ${combined.length}, expected ${shared1.kernel.length}`);
-       return 65; 
-    }
-
-    let z = denseForward(combined, shared1.kernel, shared1.bias, shared1.activation);
-    z = denseForward(z, shared2.kernel, shared2.bias, shared2.activation);
-    const output = denseForward(z, outputLayer.kernel, outputLayer.bias, outputLayer.activation);
-
-    return output[0] * 100;
-  } catch (err) {
-    console.error("AI Neural Pass failed, using fallback score:", err);
-    return 65; // Safe fallback score
-  }
-}
 
 /**
  * KMeans classify: find nearest centroid.
@@ -505,7 +354,8 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   let score = 65;
   try {
     const pyPath = path.resolve(process.cwd(), "trained-ai", "predict_score.py");
-    const { stdout } = await execFileAsync("python", [
+    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+    const { stdout, stderr } = await execFileAsync(pythonCmd, [
       pyPath,
       extracted.title,
       String(extracted.duration),
@@ -515,14 +365,19 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
       String(extracted.total),
       String(extracted.cooperating_agencies)
     ]);
+
+    if (stderr) {
+      console.warn("[AI] Python Stderr:", stderr);
+    }
     const result = JSON.parse(stdout);
     if (result.score !== undefined) {
       score = result.score;
     } else {
       console.warn("Python prediction returned error:", result.error);
     }
-  } catch (err) {
-    console.error("Python prediction failed:", err);
+  } catch (err: any) {
+    console.error("[AI] Python prediction failed. Possible reasons: Python3 not installed, missing libraries (tensorflow, sentence-transformers, joblib), or wrong file paths.");
+    console.error("[AI] Error Details:", err.message || err);
   }
 
   // Cluster profile
@@ -578,13 +433,13 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
     
     // Generate a better sounding title
     const replacedTitle = extracted.title.replace(/purchase of|procurement of/gi, "Integration of").replace(/purchase|procurement/gi, "Development");
-    suggestions.push(`💡 Title Suggestion: "${replacedTitle} for Institutional Advancement" (Shift focus from buying to researching)`);
+    suggestions.push(`Title Suggestion: "${replacedTitle} for Institutional Advancement" (Shift focus from buying to researching)`);
   } else if (extracted.title.length > 5 && extracted.title.length < 40) {
     // If the title is too short, suggest a more academic phrasing
-    suggestions.push(`💡 Title Suggestion: "Comprehensive Study and Optimization of ${extracted.title}"`);
+    suggestions.push(`Title Suggestion: "Comprehensive Study and Optimization of ${extracted.title}"`);
   } else if (profile !== "Standard R&D Project" && profile !== "Unknown") {
     // Suggest adding the profile to the title if it's unique
-    suggestions.push(`💡 Title Suggestion: "${extracted.title}: A ${profile} Initiative"`);
+    suggestions.push(`Title Suggestion: "${extracted.title}: A ${profile} Initiative"`);
   }
 
   const similarPapers: { title: string; year: string }[] = [];
