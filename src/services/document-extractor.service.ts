@@ -17,12 +17,14 @@ const officeParser = require("officeparser");
 export interface FormExtractedFields {
   program_title?: string;
   project_title?: string;
+  year?: string;
   agency_name?: string;
   agency_city?: string;
   agency_barangay?: string;
   agency_street?: string;
   telephone?: string;
   email?: string;
+  priority_areas?: string;
   cooperating_agency_names?: string[];
   research_station?: string;
   classification_type?: string; 
@@ -182,6 +184,34 @@ export function extractDataFromText(text: string): ExtractedData {
 export function extractFormFields(text: string): FormExtractedFields {
   const fields: FormExtractedFields = {};
   const clean = (s: string) => s.replace(/\s{2,}/g, " ").trim();
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const readLabeledValue = (labelPatterns: RegExp[], stopPatterns: RegExp[] = []): string | undefined => {
+    for (const line of lines) {
+      for (const labelPattern of labelPatterns) {
+        const match = line.match(labelPattern);
+        if (!match) continue;
+
+        let value = clean(match[1] || "");
+        if (!value) return undefined;
+
+        // Some PDF extracts concatenate the next label into the same line.
+        // Trim value when a known stop marker starts.
+        for (const stop of stopPatterns) {
+          const stopMatch = value.match(stop);
+          if (stopMatch && typeof stopMatch.index === "number") {
+            value = clean(value.slice(0, stopMatch.index));
+          }
+        }
+
+        return value || undefined;
+      }
+    }
+    return undefined;
+  };
 
   const programMatch = text.match(/Program\s+Title[:\s]*(.+)/i);
   if (programMatch) {
@@ -204,9 +234,17 @@ export function extractFormFields(text: string): FormExtractedFields {
     fields.project_title = clean(title);
   }
 
-  const agencyAddrMatch = text.match(/Agency\/Address[:\s]*(.+)/i);
-  if (agencyAddrMatch) {
-    const raw = clean(agencyAddrMatch[1]);
+  const yearLabelMatch = text.match(/\bYear[:\s]*([12]\d{3})\b/i);
+  if (yearLabelMatch) {
+    fields.year = yearLabelMatch[1].trim();
+  }
+
+  const agencyAddress = readLabeledValue(
+    [/^Agency\s*\/\s*Address[:\s]*(.*)$/i, /^Agency\s+Address[:\s]*(.*)$/i],
+    [/Telephone\s*\/\s*Fax\s*\/\s*Email/i, /Program\s+Title\s*:/i, /Project\s+Title\s*:/i]
+  );
+  if (agencyAddress) {
+    const raw = clean(agencyAddress);
     const parts = raw.split(/\s*\/\s*/);
     if (parts.length >= 2) {
       fields.agency_name = parts[0].trim();
@@ -226,9 +264,12 @@ export function extractFormFields(text: string): FormExtractedFields {
     }
   }
 
-  const contactMatch = text.match(/Telephone\/Fax\/Email[:\s]*(.+)/i);
-  if (contactMatch) {
-    const raw = clean(contactMatch[1]);
+  const contactLine = readLabeledValue(
+    [/^Telephone\s*\/\s*Fax\s*\/\s*Email[:\s]*(.*)$/i, /^Telephone[:\s]*(.*)$/i],
+    [/Program\s+Title\s*:/i, /Project\s+Title\s*:/i, /Leader\s*\/\s*Gender\s*:/i, /Agency\s*\/\s*Address\s*:/i]
+  );
+  if (contactLine) {
+    const raw = clean(contactLine);
     const emailInLine = raw.match(/[\w.+-]+@[\w.-]+\.\w+/);
     if (emailInLine) fields.email = emailInLine[0];
     const phoneInLine = raw.match(/[\d()+\-\s]{7,}/);
@@ -236,6 +277,24 @@ export function extractFormFields(text: string): FormExtractedFields {
     if (!fields.email && !fields.telephone && raw.length > 3) {
       fields.telephone = raw;
     }
+  }
+
+  // Fallback for PDFs where contact labels are malformed or split.
+  if (!fields.email) {
+    const emailFallback = text.match(/[\w.+-]+@[\w.-]+\.\w+/);
+    if (emailFallback) fields.email = emailFallback[0];
+  }
+
+  if (fields.telephone && /Program\s+Title/i.test(fields.telephone)) {
+    fields.telephone = undefined;
+  }
+
+  const priorityAreas = readLabeledValue(
+    [/^Priority\s+Areas?[:\s]*(.*)$/i, /^Priority\s+Area[:\s]*(.*)$/i],
+    [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i]
+  );
+  if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
+    fields.priority_areas = priorityAreas;
   }
 
   const coopMatch = text.match(/Cooperating\s+Agenc(?:y|ies)[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|\n\s*R\s*&\s*D\s+Station|$)/i);
@@ -272,6 +331,10 @@ export function extractFormFields(text: string): FormExtractedFields {
     if (val.length > 2) fields.sector = val;
   }
 
+  if (!fields.sector && fields.priority_areas) {
+    fields.sector = fields.priority_areas;
+  }
+
   const discMatch = text.match(/Discipline[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
   if (discMatch) {
     const val = clean(discMatch[1]);
@@ -297,6 +360,10 @@ export function extractFormFields(text: string): FormExtractedFields {
   if (endMatch) {
     fields.planned_end_month = endMatch[1].trim();
     fields.planned_end_year = endMatch[2].trim();
+  }
+
+  if (!fields.year) {
+    fields.year = fields.planned_start_year || fields.planned_end_year;
   }
 
   const budgetSection = text.match(/(?:Estimated\s+Budget|Source\s*\n?\s*Of\s+funds)([\s\S]*?)(?=Note:|$)/i);
