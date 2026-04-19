@@ -389,6 +389,7 @@ function extractFormFields(text) {
     }
     const priorityAreas = readLabeledValue([
         /^Priority\s+Areas?[:\s]*(.*)$/i,
+        /^Priority\s+Area\(s\)[:\s]*(.*)$/i,
         /^Priority\s+Area[:\s]*(.*)$/i,
         /^STAND\s+Classification[:\s]*(.*)$/i,
         /^STAND\s+Priority\s+Area[:\s]*(.*)$/i,
@@ -399,6 +400,9 @@ function extractFormFields(text) {
         if (/STAND/i.test(priorityAreas) || textForScan.toLowerCase().includes("stand classification")) {
             fields.stand_classification = priorityAreas;
         }
+    }
+    if (!fields.priority_areas && fields.sector) {
+        fields.priority_areas = fields.sector;
     }
     // Specific fallback for STAND if not found in priority areas
     if (!fields.stand_classification) {
