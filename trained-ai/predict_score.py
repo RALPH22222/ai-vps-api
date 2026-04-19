@@ -1,11 +1,23 @@
 import sys
 import json
 import os
-import tensorflow as tf
-from sentence_transformers import SentenceTransformer
-import joblib
+import warnings
 
+# Suppress ALL noise before heavy imports
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Force CPU mode (stops CUDA errors)
+warnings.filterwarnings("ignore")
+
+try:
+    # Heavy imports inside try to catch any missing dependency issues
+    import tensorflow as tf
+    from sentence_transformers import SentenceTransformer
+    import joblib
+    from sklearn.exceptions import InconsistentVersionWarning
+    warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+except ImportError as e:
+    print(json.dumps({"error": f"Missing dependency: {str(e)}"}))
+    sys.exit(1)
 
 try:
     title = sys.argv[1]
