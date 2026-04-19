@@ -9,6 +9,7 @@ import {
   extractFormFields, 
   SUPPORTED_TYPES 
 } from "./services/document-extractor.service";
+import { analyzeLog, isAiDebug } from "./ai-debug";
 
 dotenv.config();
 
@@ -54,7 +55,9 @@ app.post("/analyze", (req, res, next) => {
     next();
   });
 }, async (req: Request, res: Response) => {
-  console.log(`[AI] POST /analyze - ${new Date().toISOString()}`);
+  const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const t0 = Date.now();
+  analyzeLog(`HTTP:begin`, { reqId, path: "/analyze", debugAi: isAiDebug() });
   try {
     let extractedData;
     let formFields = {};
@@ -65,7 +68,12 @@ app.post("/analyze", (req, res, next) => {
 
     // Scenario A: File Upload
     if (file) {
-      console.log(`[AI] File detected: ${file.originalname}, Size: ${file.size}, Type: ${file.mimetype}`);
+      analyzeLog(`HTTP:file`, {
+        reqId,
+        originalname: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype,
+      });
       
       if (!SUPPORTED_TYPES.includes(file.mimetype as any)) {
         console.warn(`[AI] Rejected file type: ${file.mimetype}`);
@@ -74,15 +82,21 @@ app.post("/analyze", (req, res, next) => {
         });
       }
 
-      console.log(`[AI] Starting document extraction...`);
+      const tExtract = Date.now();
       const text = await extractTextFromFile(file.buffer, file.mimetype);
-      console.log(`[AI] Extraction complete. Parsing metadata...`);
+      analyzeLog(`HTTP:text ready`, { reqId, ms: Date.now() - tExtract, chars: text.length });
       extractedData = extractDataFromText(text);
       formFields = extractFormFields(text);
+      const formKeys = Object.keys(formFields as object);
+      analyzeLog(`HTTP:parsed`, { reqId, formFieldCount: formKeys.length, formKeys });
     } 
     // Scenario B: Direct JSON
     else if (req.body && (req.body.title || Object.keys(req.body).length > 0)) {
-      console.log(`[AI] JSON body detected for: "${req.body.title || "Unknown"}"`);
+      analyzeLog(`HTTP:json body`, {
+        reqId,
+        title: req.body.title || "(no title)",
+        keys: Object.keys(req.body),
+      });
       extractedData = req.body;
     } 
     else {
@@ -90,11 +104,15 @@ app.post("/analyze", (req, res, next) => {
       return res.status(400).json({ message: "No file or valid JSON data provided." });
     }
 
-    console.log(`[AI] Running neural analysis...`);
-    // Run AI analysis
+    const tAi = Date.now();
     const result = await analyzeProposal(extractedData);
-    
-    console.log(`[AI] Analysis successful for: "${result.title}"`);
+    analyzeLog(`HTTP:analyze done`, { reqId, ms: Date.now() - tAi, score: result.score, isValid: result.isValid });
+
+    analyzeLog(`HTTP:complete`, {
+      reqId,
+      totalMs: Date.now() - t0,
+      title: result.title?.slice(0, 80),
+    });
     // Merge form fields if they were extracted
     return res.json({ ...result, formFields });
     
@@ -108,6 +126,9 @@ app.post("/analyze", (req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 AI Analysis VPS API running on http://localhost:${PORT}`);
-  console.log(`📁 Document parsing (mammoth/pdf-parse) enabled.`);
+  console.log(`AI Analysis VPS API running on http://localhost:${PORT}`);
+  console.log(`Document parsing (mammoth/pdf-parse) enabled.`);
+  console.log(
+    `🔧 Verbose AI/extractor logs: set DEBUG_AI=1 (or true) — previews and python stdout/stderr snippets.`
+  );
 });

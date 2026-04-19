@@ -8,6 +8,7 @@ exports.extractTextFromFile = extractTextFromFile;
 exports.extractDataFromText = extractDataFromText;
 exports.extractFormFields = extractFormFields;
 const mammoth_1 = __importDefault(require("mammoth"));
+const ai_debug_1 = require("../ai-debug");
 // pdf-parse import can be tricky across different Node/TS environments.
 // We try the standard import first, then fall back if needed.
 let pdf;
@@ -28,13 +29,17 @@ exports.SUPPORTED_TYPES = [
  * Extract plain text from a document buffer based on its MIME type.
  */
 async function extractTextFromFile(buffer, contentType) {
-    console.log(`[Extractor] Parsing file of type: ${contentType}, size: ${buffer.length} bytes`);
+    const t0 = Date.now();
+    (0, ai_debug_1.extractorLog)(`Parsing buffer`, { contentType, bytes: buffer.length });
     switch (contentType) {
         case "application/pdf": {
             try {
                 const pdfData = await pdf(buffer);
-                console.log(`[Extractor] PDF parsed successfully, characters: ${pdfData.text?.length}`);
-                return pdfData.text;
+                const text = pdfData.text;
+                const ms = Date.now() - t0;
+                (0, ai_debug_1.extractorLog)(`PDF parse done`, { ms, chars: text?.length ?? 0 });
+                (0, ai_debug_1.extractorDebug)("PDF text preview", { preview: (0, ai_debug_1.truncateForLog)(text || "", 400) });
+                return text;
             }
             catch (err) {
                 console.error("[Extractor] PDF Parse failed:", err);
@@ -44,8 +49,11 @@ async function extractTextFromFile(buffer, contentType) {
         case "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {
             try {
                 const result = await mammoth_1.default.extractRawText({ buffer });
-                console.log(`[Extractor] DOCX parsed successfully, characters: ${result.value?.length}`);
-                return result.value;
+                const text = result.value;
+                const ms = Date.now() - t0;
+                (0, ai_debug_1.extractorLog)(`DOCX parse done`, { ms, chars: text?.length ?? 0 });
+                (0, ai_debug_1.extractorDebug)("DOCX text preview", { preview: (0, ai_debug_1.truncateForLog)(text || "", 400) });
+                return text;
             }
             catch (err) {
                 console.error("[Extractor] DOCX Parse failed:", err);
@@ -54,9 +62,12 @@ async function extractTextFromFile(buffer, contentType) {
         }
         case "application/msword": {
             try {
-                const text = await officeParser.parseOfficeAsync(buffer);
-                console.log(`[Extractor] DOC parsed successfully`);
-                return typeof text === "string" ? text : String(text);
+                const raw = await officeParser.parseOfficeAsync(buffer);
+                const text = typeof raw === "string" ? raw : String(raw);
+                const ms = Date.now() - t0;
+                (0, ai_debug_1.extractorLog)(`DOC parse done`, { ms, chars: text.length });
+                (0, ai_debug_1.extractorDebug)("DOC text preview", { preview: (0, ai_debug_1.truncateForLog)(text, 400) });
+                return text;
             }
             catch (err) {
                 console.error("[Extractor] DOC Parse failed:", err);
@@ -152,7 +163,54 @@ function extractDataFromText(text) {
             }
         }
     }
+    (0, ai_debug_1.extractorLog)(`Metadata (for AI analyzer)`, {
+        titleLen: data.title.length,
+        duration: data.duration,
+        cooperating_agencies: data.cooperating_agencies,
+        total: data.total,
+        ps: data.ps,
+        mooe: data.mooe,
+        co: data.co,
+    });
+    (0, ai_debug_1.extractorDebug)("Project title preview", { title: (0, ai_debug_1.truncateForLog)(data.title, 160) });
     return data;
+}
+/**
+ * Many PDFs export as one long line or reorder text — patterns anchored with ^ miss.
+ * Grab Agency/Address … up to Telephone/Fax/Email from the raw string (no line anchors).
+ */
+function extractAgencyAddressBlobFromFullText(fullText) {
+    const patterns = [
+        /Agency\s*\/\s*Agency\s+Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email)\b)/i,
+        /Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email)\b)/i,
+        /Agency\s*\/\s*(?:Agency\s+)?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*Leader\s*\/\s*Gender\b)/i,
+        /Agency\s*\/\s*(?:Agency\s+)?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*\(\d+\)\s*[^\s])/i,
+    ];
+    for (const p of patterns) {
+        const m = fullText.match(p);
+        if (m?.[1]) {
+            const v = m[1].replace(/\s{2,}/g, " ").trim();
+            if (v.length > 2 && !/^Telephone/i.test(v))
+                return v;
+        }
+    }
+    return undefined;
+}
+/** PDFs often repeat the section header; pick the first value that looks like real contact info. */
+function pickBestTelephoneFaxEmailValue(fullText, cleanFn, isGarbage) {
+    const re = /Telephone\s*\/\s*Fax\s*\/\s*Email\s*[:\s]*\s*([^\n\r]{1,1200})/gi;
+    const candidates = [];
+    let m;
+    while ((m = re.exec(fullText)) !== null) {
+        candidates.push(cleanFn(m[1]));
+    }
+    const withEmail = candidates.find((c) => /[\w.+-]+@[\w.-]+\.\w+/.test(c) && !isGarbage(c));
+    if (withEmail)
+        return withEmail;
+    const withPhone = candidates.find((c) => /[\d()+\-\s]{7,}/.test(c) && !isGarbage(c));
+    if (withPhone)
+        return withPhone;
+    return candidates.find((c) => c.length > 2 && !isGarbage(c) && !/^N\/?A$/i.test(c));
 }
 /**
  * Extract form-fillable fields from the DOST Capsule Proposal template text.
@@ -160,17 +218,56 @@ function extractDataFromText(text) {
 function extractFormFields(text) {
     const fields = {};
     const clean = (s) => s.replace(/\s{2,}/g, " ").trim();
-    const programMatch = text.match(/Program\s+Title[:\s]*(.+)/i);
+    const textForScan = text.replace(/\u00a0/g, " ");
+    const lines = textForScan
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    /** PDFs often merge the next block label into the same line as agency or contact. */
+    const stripAfterContactLabel = (s) => clean(s.replace(/\bTelephone\s*\/\s*Fax\s*\/\s*Email\b[\s\S]*/i, ""));
+    const isGarbageContactValue = (s) => !s ||
+        /^Telephone\s*\/\s*Fax\s*\/\s*Email$/i.test(s) ||
+        /Program\s+Title/i.test(s) ||
+        /Project\s+Title/i.test(s) ||
+        /^Leader\s*\/\s*Gender/i.test(s);
+    const isGarbageAddressSegment = (s) => !s ||
+        /^Telephone/i.test(s) ||
+        /Fax\s*\/\s*Email/i.test(s) ||
+        /Program\s+Title/i.test(s) ||
+        /Project\s+Title/i.test(s);
+    const readLabeledValue = (labelPatterns, stopPatterns = []) => {
+        for (const line of lines) {
+            for (const labelPattern of labelPatterns) {
+                const match = line.match(labelPattern);
+                if (!match)
+                    continue;
+                let value = clean(match[1] || "");
+                if (!value)
+                    continue;
+                // Some PDF extracts concatenate the next label into the same line.
+                // Trim value when a known stop marker starts.
+                for (const stop of stopPatterns) {
+                    const stopMatch = value.match(stop);
+                    if (stopMatch && typeof stopMatch.index === "number") {
+                        value = clean(value.slice(0, stopMatch.index));
+                    }
+                }
+                return value || undefined;
+            }
+        }
+        return undefined;
+    };
+    const programMatch = textForScan.match(/Program\s+Title[:\s]*(.+)/i);
     if (programMatch) {
         const val = clean(programMatch[1]);
         if (val && !/^N\/?A$/i.test(val))
             fields.program_title = val;
     }
-    const projectMatch = text.match(/Project\s+Title[:\s]*(.+)/i);
+    const projectMatch = textForScan.match(/Project\s+Title[:\s]*(.+)/i);
     if (projectMatch) {
         let title = projectMatch[1].trim();
         const matchEnd = (projectMatch.index ?? 0) + projectMatch[0].length;
-        const rest = text.substring(matchEnd);
+        const rest = textForScan.substring(matchEnd);
         const nextLine = rest.match(/^\n([^\n]+)/);
         if (nextLine) {
             const nl = nextLine[1].trim();
@@ -180,13 +277,25 @@ function extractFormFields(text) {
         }
         fields.project_title = clean(title);
     }
-    const agencyAddrMatch = text.match(/Agency\/Address[:\s]*(.+)/i);
-    if (agencyAddrMatch) {
-        const raw = clean(agencyAddrMatch[1]);
-        const parts = raw.split(/\s*\/\s*/);
+    const yearLabelMatch = textForScan.match(/\bYear[:\s]*([12]\d{3})\b/i);
+    if (yearLabelMatch) {
+        fields.year = yearLabelMatch[1].trim();
+    }
+    const applyAgencyFromRaw = (rawInput) => {
+        const raw = stripAfterContactLabel(clean(rawInput));
+        if (!raw)
+            return;
+        const parts = raw.split(/\s*\/\s*/).map((p) => p.trim()).filter(Boolean);
         if (parts.length >= 2) {
-            fields.agency_name = parts[0].trim();
-            const addrParts = parts.slice(1).join("/").split(",").map(s => s.trim());
+            const name = parts[0].trim();
+            if (name)
+                fields.agency_name = name;
+            const addrParts = parts
+                .slice(1)
+                .join("/")
+                .split(",")
+                .map((s) => s.trim())
+                .filter((p) => p && !isGarbageAddressSegment(p));
             if (addrParts.length >= 3) {
                 fields.agency_street = addrParts[0];
                 fields.agency_barangay = addrParts[1];
@@ -203,34 +312,82 @@ function extractFormFields(text) {
         else {
             fields.agency_name = raw;
         }
+    };
+    const agencyBlob = extractAgencyAddressBlobFromFullText(textForScan);
+    if (agencyBlob) {
+        applyAgencyFromRaw(agencyBlob);
     }
-    const contactMatch = text.match(/Telephone\/Fax\/Email[:\s]*(.+)/i);
-    if (contactMatch) {
-        const raw = clean(contactMatch[1]);
-        const emailInLine = raw.match(/[\w.+-]+@[\w.-]+\.\w+/);
-        if (emailInLine)
-            fields.email = emailInLine[0];
-        const phoneInLine = raw.match(/[\d()+\-\s]{7,}/);
-        if (phoneInLine)
-            fields.telephone = phoneInLine[0].trim();
-        if (!fields.email && !fields.telephone && raw.length > 3) {
-            fields.telephone = raw;
+    if (!fields.agency_name) {
+        const agencyAddress = readLabeledValue([
+            /^Agency\s*\/\s*Agency\s+Address[:\s]*(.*)$/i,
+            /^Agency\s*\/\s*Address[:\s]*(.*)$/i,
+            /^Agency\s+Address[:\s]*(.*)$/i,
+        ], [/Telephone\s*\/\s*Fax\s*\/\s*Email/i, /Program\s+Title\s*:/i, /Project\s+Title\s*:/i]);
+        if (agencyAddress)
+            applyAgencyFromRaw(agencyAddress);
+    }
+    let contactLine = pickBestTelephoneFaxEmailValue(textForScan, clean, isGarbageContactValue);
+    if (!contactLine) {
+        contactLine = readLabeledValue([/^Telephone\s*\/\s*Fax\s*\/\s*Email[:\s]*(.*)$/i], [/Program\s+Title\s*:/i, /Project\s+Title\s*:/i, /Leader\s*\/\s*Gender\s*:/i, /Agency\s*\/\s*Address\s*:/i]);
+    }
+    if (!contactLine) {
+        const loose = textForScan.match(/Telephone\s*\/\s*Fax\s*\/\s*Email[:\s]*([^\n\r]+)/i);
+        if (loose?.[1])
+            contactLine = clean(loose[1]);
+    }
+    if (contactLine) {
+        const raw = clean(contactLine);
+        if (!isGarbageContactValue(raw)) {
+            const emailInLine = raw.match(/[\w.+-]+@[\w.-]+\.\w+/);
+            if (emailInLine)
+                fields.email = emailInLine[0];
+            const phoneInLine = raw.match(/[\d()+\-\s]{7,}/);
+            if (phoneInLine)
+                fields.telephone = phoneInLine[0].trim();
+            if (!fields.email && !fields.telephone && raw.length > 3 && !isGarbageContactValue(raw)) {
+                fields.telephone = raw;
+            }
         }
     }
-    const coopMatch = text.match(/Cooperating\s+Agenc(?:y|ies)[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|\n\s*R\s*&\s*D\s+Station|$)/i);
+    // Fallback for PDFs where contact labels are malformed or split.
+    if (!fields.email) {
+        const emailFallback = textForScan.match(/[\w.+-]+@[\w.-]+\.\w+/);
+        if (emailFallback)
+            fields.email = emailFallback[0];
+    }
+    if (fields.telephone && isGarbageContactValue(fields.telephone)) {
+        delete fields.telephone;
+    }
+    if (fields.agency_city && isGarbageAddressSegment(fields.agency_city)) {
+        delete fields.agency_city;
+    }
+    if (fields.agency_street && isGarbageAddressSegment(fields.agency_street)) {
+        delete fields.agency_street;
+    }
+    if (fields.agency_barangay && isGarbageAddressSegment(fields.agency_barangay)) {
+        delete fields.agency_barangay;
+    }
+    if (fields.agency_name !== undefined && !String(fields.agency_name).trim()) {
+        delete fields.agency_name;
+    }
+    const priorityAreas = readLabeledValue([/^Priority\s+Areas?[:\s]*(.*)$/i, /^Priority\s+Area[:\s]*(.*)$/i], [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i]);
+    if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
+        fields.priority_areas = priorityAreas;
+    }
+    const coopMatch = textForScan.match(/Cooperating\s+Agenc(?:y|ies)[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|\n\s*R\s*&\s*D\s+Station|$)/i);
     if (coopMatch) {
         const raw = clean(coopMatch[1]);
         if (raw.length > 2 && !/^N\/?A$/i.test(raw)) {
             fields.cooperating_agency_names = raw.split(/,\s*/).map(s => s.trim()).filter(Boolean);
         }
     }
-    const stationMatch = text.match(/R\s*&?\s*D\s+Station[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
+    const stationMatch = textForScan.match(/R\s*&?\s*D\s+Station[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
     if (stationMatch) {
         const val = clean(stationMatch[1]);
         if (val.length > 2)
             fields.research_station = val;
     }
-    const classSection = text.match(/Classification[^\n]*\n([\s\S]*?)(?=\n\s*\(\d\)\s*(?:Mode|Priority|Sector)|$)/i);
+    const classSection = textForScan.match(/Classification[^\n]*\n([\s\S]*?)(?=\n\s*\(\d\)\s*(?:Mode|Priority|Sector)|$)/i);
     if (classSection) {
         const classText = classSection[1];
         const hasBasic = /(?:_+|[xX✓✔])\s*Basic/i.test(classText);
@@ -254,20 +411,32 @@ function extractFormFields(text) {
             fields.class_input = "tech_promotion";
         }
     }
-    const sectorMatch = text.match(/Sector\/Commodity[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
-    if (sectorMatch) {
-        const val = clean(sectorMatch[1]);
-        if (val.length > 2)
-            fields.sector = val;
+    // Same-line PDF extracts often put the value after "Sector/Commodity:" on one line.
+    let sectorVal = readLabeledValue([/^Sector\s*\/\s*Commodity[:\s]*(.*)$/i], [/^\(\d+\)\s*/, /^Discipline\b/i, /\n\s*Discipline\b/i]);
+    if (!sectorVal) {
+        const sectorLoose = textForScan.match(/Sector\s*\/\s*Commodity[:\s]*([^\n\r]+)/i);
+        if (sectorLoose?.[1])
+            sectorVal = clean(sectorLoose[1]);
     }
-    const discMatch = text.match(/Discipline[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
-    if (discMatch) {
-        const val = clean(discMatch[1]);
-        if (val.length > 2)
-            fields.discipline = val;
+    if (sectorVal) {
+        sectorVal = clean(sectorVal.split(/\bDiscipline\b/i)[0] ?? sectorVal);
+        if (sectorVal.length > 2)
+            fields.sector = sectorVal;
     }
-    const monthsMatch = text.match(/\(In\s+months\)\s*(\d+)/i);
-    const durationAlt = text.match(/Duration[:\s]*(\d+)/i);
+    if (!fields.sector && fields.priority_areas) {
+        fields.sector = fields.priority_areas;
+    }
+    let disciplineVal = readLabeledValue([/^Discipline[:\s]*(.*)$/i], [/^\(\d+\)\s*/, /\n\s*\(\d+\)/]);
+    if (!disciplineVal) {
+        const discLoose = textForScan.match(/Discipline[:\s]*([^\n\r]+)/i);
+        if (discLoose?.[1])
+            disciplineVal = clean(discLoose[1]);
+    }
+    if (disciplineVal && disciplineVal.length > 2) {
+        fields.discipline = disciplineVal;
+    }
+    const monthsMatch = textForScan.match(/\(In\s+months\)\s*(\d+)/i);
+    const durationAlt = textForScan.match(/Duration[:\s]*(\d+)/i);
     if (monthsMatch) {
         fields.duration = parseInt(monthsMatch[1], 10);
     }
@@ -276,17 +445,20 @@ function extractFormFields(text) {
         if (val > 0 && val < 120)
             fields.duration = val;
     }
-    const startMatch = text.match(/Planned\s+[Ss]tart\s+[Dd]ate\s*[_\s]*([A-Za-z]+)[_\s]*(\d{4})/i);
+    const startMatch = textForScan.match(/Planned\s+[Ss]tart\s+[Dd]ate\s*[_\s]*([A-Za-z]+)[_\s]*(\d{4})/i);
     if (startMatch) {
         fields.planned_start_month = startMatch[1].trim();
         fields.planned_start_year = startMatch[2].trim();
     }
-    const endMatch = text.match(/Planned\s+(?:Completion|[Ee]nd)\s+[Dd]ate\s*[_\s]*([A-Za-z]+)[_\s]*(\d{4})/i);
+    const endMatch = textForScan.match(/Planned\s+(?:Completion|[Ee]nd)\s+[Dd]ate\s*[_\s]*([A-Za-z]+)[_\s]*(\d{4})/i);
     if (endMatch) {
         fields.planned_end_month = endMatch[1].trim();
         fields.planned_end_year = endMatch[2].trim();
     }
-    const budgetSection = text.match(/(?:Estimated\s+Budget|Source\s*\n?\s*Of\s+funds)([\s\S]*?)(?=Note:|$)/i);
+    if (!fields.year) {
+        fields.year = fields.planned_start_year || fields.planned_end_year;
+    }
+    const budgetSection = textForScan.match(/(?:Estimated\s+Budget|Source\s*\n?\s*Of\s+funds)([\s\S]*?)(?=Note:|$)/i);
     if (budgetSection) {
         const budgetText = budgetSection[1];
         const sources = [];
@@ -317,5 +489,19 @@ function extractFormFields(text) {
         if (sources.length > 0)
             fields.budget_sources = sources;
     }
+    const formKeys = Object.keys(fields);
+    (0, ai_debug_1.extractorLog)(`Form autofill fields`, { count: formKeys.length, keys: formKeys });
+    (0, ai_debug_1.extractorDebug)("Form field sample values", {
+        sample: Object.fromEntries(formKeys.map((k) => {
+            const v = fields[k];
+            if (v === undefined)
+                return [k, undefined];
+            if (typeof v === "string")
+                return [k, (0, ai_debug_1.truncateForLog)(v, 100)];
+            if (Array.isArray(v))
+                return [k, v.length > 3 ? `[${v.length} items]` : v];
+            return [k, v];
+        })),
+    });
     return fields;
 }

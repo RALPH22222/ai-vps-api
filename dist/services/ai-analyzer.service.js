@@ -6,6 +6,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.analyzeProposal = analyzeProposal;
 const path_1 = __importDefault(require("path"));
 const fs_1 = require("fs");
+const child_process_1 = require("child_process");
+const util_1 = __importDefault(require("util"));
+const ai_debug_1 = require("../ai-debug");
+const execFileAsync = util_1.default.promisify(child_process_1.execFile);
 // ── Model loading ────────────────────────────────────────────────────
 const MODELS_DIR = (0, fs_1.existsSync)(path_1.default.join(__dirname, "..", "ai-models"))
     ? path_1.default.join(__dirname, "..", "ai-models")
@@ -15,17 +19,9 @@ function loadJSON(filename) {
     return JSON.parse(raw);
 }
 // Lazy-loaded singletons (JSON-based models)
-let _denseLayers = null;
 let _scaler = null;
 let _kmeans = null;
-let _comparisonDB = null;
-let _vocab = null;
-let _embeddings = null;
-function getDenseLayers() {
-    if (!_denseLayers)
-        _denseLayers = loadJSON("dense_layers.json");
-    return _denseLayers;
-}
+let _nsfAwards = null;
 function getScaler() {
     if (!_scaler)
         _scaler = loadJSON("scaler.json");
@@ -36,32 +32,40 @@ function getKMeans() {
         _kmeans = loadJSON("kmeans.json");
     return _kmeans;
 }
-function getComparisonDB() {
-    if (!_comparisonDB)
-        _comparisonDB = loadJSON("comparison_db.json");
-    return _comparisonDB;
-}
-function getVocabDB() {
-    if (!_vocab) {
+function getNSFAwards() {
+    if (!_nsfAwards) {
         try {
-            _vocab = loadJSON("vocab.json");
+            const csvPath = path_1.default.resolve(process.cwd(), "trained-ai", "NSF_Award_Search_cleaned.csv");
+            const content = (0, fs_1.readFileSync)(csvPath, "utf-8");
+            const lines = content.split(/\r?\n/);
+            _nsfAwards = [];
+            for (let i = 1; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line)
+                    continue;
+                let title = "";
+                if (line.startsWith('"')) {
+                    const endQuoteIdx = line.indexOf('",');
+                    if (endQuoteIdx !== -1) {
+                        title = line.substring(1, endQuoteIdx);
+                    }
+                    else {
+                        title = line.substring(1, line.length - 1);
+                    }
+                }
+                else {
+                    title = line.split(',')[0];
+                }
+                if (title)
+                    _nsfAwards.push({ title });
+            }
         }
         catch (e) {
-            _vocab = {};
+            console.error("Failed to load NSF CSV", e);
+            _nsfAwards = [];
         }
     }
-    return _vocab;
-}
-function getEmbeddingDB() {
-    if (!_embeddings) {
-        try {
-            _embeddings = loadJSON("embedding.json");
-        }
-        catch (e) {
-            _embeddings = {};
-        }
-    }
-    return _embeddings;
+    return _nsfAwards;
 }
 // ── Fast Local Text Encoder (replaces ONNX/HuggingFace) ──────────────
 // A pure-JS implementation of Keras AveragePooling Embedding layer to map
@@ -82,72 +86,7 @@ function tokenize(text) {
         .split(/\s+/)
         .filter(w => w.length > 2 && !stops.has(w));
 }
-async function encodeTitle(title) {
-    const vocab = getVocabDB();
-    const embeddings = getEmbeddingDB();
-    const words = tokenize(title);
-    const vec = new Array(128).fill(0);
-    let count = 0;
-    for (const w of words) {
-        if (vocab[w] !== undefined) {
-            const idx = vocab[w];
-            const emb = embeddings[String(idx)];
-            if (emb) {
-                for (let i = 0; i < 128; i++)
-                    vec[i] += emb[i];
-                count++;
-            }
-        }
-    }
-    // Average pooling pooling: "mean"
-    if (count > 0) {
-        for (let i = 0; i < 128; i++)
-            vec[i] /= count;
-    }
-    return vec;
-}
 // ── Math primitives ──────────────────────────────────────────────────
-function relu(x) {
-    return x > 0 ? x : 0;
-}
-function sigmoid(x) {
-    return 1 / (1 + Math.exp(-x));
-}
-/** Matrix-vector multiply: result[j] = sum_i(input[i] * kernel[i][j]) + bias[j] */
-function denseForward(input, kernel, bias, activation) {
-    const outputDim = bias.length;
-    const result = new Array(outputDim);
-    for (let j = 0; j < outputDim; j++) {
-        let sum = bias[j];
-        for (let i = 0; i < input.length; i++) {
-            sum += input[i] * kernel[i][j];
-        }
-        if (activation === "relu") {
-            result[j] = relu(sum);
-        }
-        else if (activation === "sigmoid") {
-            result[j] = sigmoid(sum);
-        }
-        else {
-            result[j] = sum; // linear
-        }
-    }
-    return result;
-}
-/** Cosine similarity between two vectors */
-function cosineSimilarity(a, b) {
-    const len = Math.min(a.length, b.length);
-    let dot = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < len; i++) {
-        dot += a[i] * b[i];
-        normA += a[i] * a[i];
-        normB += b[i] * b[i];
-    }
-    const denom = Math.sqrt(normA) * Math.sqrt(normB);
-    return denom === 0 ? 0 : dot / denom;
-}
 /** Euclidean distance between two vectors */
 function euclideanDistance(a, b) {
     let sum = 0;
@@ -168,40 +107,6 @@ function scaleMetadata(raw) {
 /**
  * Full model forward pass. Returns score 0-100.
  */
-function predict(titleVec, scaledMeta) {
-    try {
-        const layers = getDenseLayers();
-        // Map the 7 explicitly found layers from Python Keras config
-        const metaLayer1 = layers.find(l => l.name === "meta_dense_1");
-        const textLayer1 = layers.find(l => l.name === "text_dense_1");
-        const textLayerFinal = layers.find(l => l.name === "text_dense_final");
-        const metaLayerFinal = layers.find(l => l.name === "meta_dense_final");
-        const shared1 = layers.find(l => l.name === "shared_dense_1" || l.name === "dense_2" || l.kernel.length === 96);
-        const shared2 = layers.find(l => l.name === "shared_dense_2" || l.name === "dense_3" || l.kernel.length === 64);
-        const outputLayer = layers.find(l => l.name === "output_layer" || l.name === "output" || l.kernel[0].length === 1);
-        // 1. Text Branch (128 -> 128 -> 64)
-        let x1 = denseForward(titleVec, textLayer1.kernel, textLayer1.bias, textLayer1.activation);
-        x1 = denseForward(x1, textLayerFinal.kernel, textLayerFinal.bias, textLayerFinal.activation);
-        // 2. Meta Branch (6 -> 64 -> 32)
-        let x2 = denseForward(scaledMeta, metaLayer1.kernel, metaLayer1.bias, metaLayer1.activation);
-        x2 = denseForward(x2, metaLayerFinal.kernel, metaLayerFinal.bias, metaLayerFinal.activation);
-        // 3. Shared Branch: concat(64, 32) -> Dense(64) -> Dense(32) -> Dense(1)
-        const combined = [...x1, ...x2];
-        // Safety check for concatenation dimension
-        if (combined.length !== shared1.kernel.length) {
-            console.warn(`Shape mismatch in concat: got ${combined.length}, expected ${shared1.kernel.length}`);
-            return 65;
-        }
-        let z = denseForward(combined, shared1.kernel, shared1.bias, shared1.activation);
-        z = denseForward(z, shared2.kernel, shared2.bias, shared2.activation);
-        const output = denseForward(z, outputLayer.kernel, outputLayer.bias, outputLayer.activation);
-        return output[0] * 100;
-    }
-    catch (err) {
-        console.error("AI Neural Pass failed, using fallback score:", err);
-        return 65; // Safe fallback score
-    }
-}
 /**
  * KMeans classify: find nearest centroid.
  * Returns cluster description string.
@@ -220,23 +125,85 @@ function classify(scaledMeta) {
     return kmeans.descriptions[String(bestCluster)] ?? "Unknown";
 }
 /**
- * Novelty check via cosine similarity against precomputed DB titles.
+ * When the Python Keras predictor is unavailable or errors, derive compliance 0–100
+ * from budget/duration/co-agency signals instead of a hardcoded 65.
  */
-function checkUniqueness(titleVec) {
-    const db = getComparisonDB();
-    let bestIdx = 0;
+function heuristicComplianceScore(extracted, profile) {
+    let s = 72;
+    const dur = extracted.duration;
+    if (dur >= 6 && dur <= 36)
+        s += 8;
+    else if (dur < 6)
+        s -= 18;
+    else if (dur > 48)
+        s -= 6;
+    const total = extracted.total;
+    if (total > 0 && extracted.ps > 0) {
+        const psRatio = extracted.ps / total;
+        if (psRatio > 0.6)
+            s -= 22;
+        else if (psRatio > 0.45)
+            s -= 8;
+        else
+            s += 4;
+    }
+    if (extracted.cooperating_agencies >= 2)
+        s += 6;
+    else if (extracted.cooperating_agencies === 1)
+        s += 3;
+    if (profile === "Large-Scale Collaborative Grant")
+        s += 4;
+    if (profile.includes("High-Salary") || profile.includes("Overhead"))
+        s -= 5;
+    if (total <= 0 && dur <= 0)
+        s -= 15;
+    return Math.min(100, Math.max(25, Math.round(s)));
+}
+function getTermFrequencies(words) {
+    const freqs = {};
+    for (const w of words) {
+        freqs[w] = (freqs[w] || 0) + 1;
+    }
+    return freqs;
+}
+function textCosineSimilarity(text1, text2) {
+    const words1 = tokenize(text1);
+    const words2 = tokenize(text2);
+    const tf1 = getTermFrequencies(words1);
+    const tf2 = getTermFrequencies(words2);
+    let dot = 0;
+    let norm1 = 0;
+    let norm2 = 0;
+    for (const count of Object.values(tf1))
+        norm1 += count * count;
+    for (const count of Object.values(tf2))
+        norm2 += count * count;
+    if (norm1 === 0 || norm2 === 0)
+        return 0;
+    for (const [w, count] of Object.entries(tf1)) {
+        if (tf2[w])
+            dot += count * tf2[w];
+    }
+    return dot / (Math.sqrt(norm1) * Math.sqrt(norm2));
+}
+/**
+ * Novelty check via text cosine similarity against NSF Award DB.
+ */
+function checkUniqueness(title) {
+    const awards = getNSFAwards();
+    let bestTitle = "Unknown";
     let maxSim = -1;
-    for (let i = 0; i < db.vectors.length; i++) {
-        const sim = cosineSimilarity(titleVec, db.vectors[i]);
+    for (const award of awards) {
+        const sim = textCosineSimilarity(title, award.title);
         if (sim > maxSim) {
             maxSim = sim;
-            bestIdx = i;
+            bestTitle = award.title;
         }
     }
     return {
-        noveltyScore: Math.round((1 - maxSim) * 100),
-        bestMatchTitle: db.titles[bestIdx] ?? "Unknown",
-        bestMatchSimilarity: maxSim === -1 ? 0 : maxSim,
+        noveltyScore: Math.round((1 - Math.max(0, maxSim)) * 100),
+        bestMatchTitle: bestTitle,
+        bestMatchSimilarity: Math.max(0, maxSim),
     };
 }
 // ── Public API ───────────────────────────────────────────────────────
@@ -257,7 +224,7 @@ async function analyzeProposal(extracted) {
             issues: [
                 "Cannot detect proposal content. Please try again.",
                 "",
-                "Your PDF must follow the standard VAWC Capsule Proposal format:",
+                "Your PDF must follow the standard DOST Form No.1B format:",
                 "",
                 "Required sections:",
                 "  ✓ Project Title: [Your project title here]",
@@ -271,10 +238,10 @@ async function analyzeProposal(extracted) {
                 "  • Document structure doesn't match template",
                 "  • File is corrupted or password-protected",
                 "",
-                "📄 Reference format: VAWC_CapsuleProposal-updated.pdf"
+                "Reference format: DOST Form No.1B"
             ],
             suggestions: [
-                "Use the official VAWC Capsule Proposal template",
+                "Use the official DOST Form No.1B template",
                 "Ensure 'Project Title:' label is present in the document",
                 "If using a scanned PDF, apply OCR (Optical Character Recognition)",
                 "Check that the PDF contains extractable text (not just images)",
@@ -349,14 +316,70 @@ async function analyzeProposal(extracted) {
         extracted.cooperating_agencies,
     ];
     const scaledMeta = scaleMetadata(rawMeta);
-    // Encode title to 128-dim memory-efficient Keras embedded semantic vector
-    const titleVec = await encodeTitle(extracted.title);
-    // AI Score (0-100) — full neural network forward pass (7 Layers)
-    const score = Math.round(predict(titleVec, scaledMeta));
-    // Cluster profile
     const profile = classify(scaledMeta);
-    // Novelty / uniqueness check (cosine similarity against comparison DB)
-    const { noveltyScore, bestMatchTitle, bestMatchSimilarity } = checkUniqueness(titleVec);
+    (0, ai_debug_1.analyzeLog)("AI:inputs", {
+        titleLen: extracted.title.length,
+        duration: extracted.duration,
+        total: extracted.total,
+        ps: extracted.ps,
+        mooe: extracted.mooe,
+        co: extracted.co,
+        cooperating_agencies: extracted.cooperating_agencies,
+        profile,
+    });
+    (0, ai_debug_1.analyzeDebug)("AI:scaledMeta", { scaledMeta });
+    (0, ai_debug_1.analyzeDebug)("AI:title preview", { title: (0, ai_debug_1.truncateForLog)(extracted.title, 200) });
+    // Optional: Python Keras + sentence-transformers (often missing on VPS → use heuristic below).
+    let score;
+    let complianceScoreSource = "heuristic";
+    const pyPath = path_1.default.resolve(process.cwd(), "trained-ai", "predict_score.py");
+    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+    (0, ai_debug_1.analyzeDebug)("AI:python", { pyPath, pythonCmd, cwd: process.cwd() });
+    try {
+        const tPy = Date.now();
+        const { stdout, stderr } = await execFileAsync(pythonCmd, [
+            pyPath,
+            extracted.title,
+            String(extracted.duration),
+            String(extracted.mooe),
+            String(extracted.ps),
+            String(extracted.co),
+            String(extracted.total),
+            String(extracted.cooperating_agencies)
+        ]);
+        if (stderr) {
+            console.warn("[AI] Python Stderr:", stderr);
+            (0, ai_debug_1.analyzeDebug)("AI:python stderr", { stderr: (0, ai_debug_1.truncateForLog)(String(stderr), 500) });
+        }
+        const result = JSON.parse(stdout.trim());
+        (0, ai_debug_1.analyzeDebug)("AI:python stdout", { raw: (0, ai_debug_1.truncateForLog)(stdout.trim(), 500) });
+        if (typeof result.score === "number" && !Number.isNaN(result.score) && result.error == null) {
+            score = result.score;
+            complianceScoreSource = "python-keras";
+            (0, ai_debug_1.analyzeLog)("AI:python scorer ok", { ms: Date.now() - tPy, score: result.score });
+        }
+        else if (result.error) {
+            console.warn("[AI] Python scorer error (using heuristic compliance score):", result.error);
+            (0, ai_debug_1.analyzeLog)("AI:python scorer error", { ms: Date.now() - tPy, error: (0, ai_debug_1.truncateForLog)(result.error, 300) });
+        }
+    }
+    catch (err) {
+        console.error("[AI] Python prediction failed. Possible reasons: Python3 not installed, missing libraries (tensorflow, sentence-transformers, joblib), or wrong file paths.");
+        console.error("[AI] Error Details:", err.message || err);
+        (0, ai_debug_1.analyzeLog)("AI:python exec failed", { message: err?.message || String(err) });
+    }
+    if (score === undefined) {
+        score = heuristicComplianceScore(extracted, profile);
+        complianceScoreSource = "heuristic";
+        (0, ai_debug_1.analyzeLog)("AI:compliance heuristic", { score });
+    }
+    // Novelty / uniqueness check (cosine similarity against NSF CSV)
+    const { noveltyScore, bestMatchTitle, bestMatchSimilarity } = checkUniqueness(extracted.title);
+    (0, ai_debug_1.analyzeLog)("AI:novelty", {
+        noveltyScore,
+        bestMatchSimilarity: Math.round(bestMatchSimilarity * 1000) / 1000,
+        bestMatchTitle: (0, ai_debug_1.truncateForLog)(bestMatchTitle, 120),
+    });
     const issues = [];
     const suggestions = [];
     const similarityPct = Math.round(bestMatchSimilarity * 100);
@@ -403,6 +426,17 @@ async function analyzeProposal(extracted) {
     const titleLower = extracted.title.toLowerCase();
     if (titleLower.includes("purchase") || titleLower.includes("procurement")) {
         issues.push("Feasibility alert: Proposal sounds more like a procurement request than a scientific research project.");
+        // Generate a better sounding title
+        const replacedTitle = extracted.title.replace(/purchase of|procurement of/gi, "Integration of").replace(/purchase|procurement/gi, "Development");
+        suggestions.push(`Title Suggestion: "${replacedTitle} for Institutional Advancement" (Shift focus from buying to researching)`);
+    }
+    else if (extracted.title.length > 5 && extracted.title.length < 40) {
+        // If the title is too short, suggest a more academic phrasing
+        suggestions.push(`Title Suggestion: "Comprehensive Study and Optimization of ${extracted.title}"`);
+    }
+    else if (profile !== "Standard R&D Project" && profile !== "Unknown") {
+        // Suggest adding the profile to the title if it's unique
+        suggestions.push(`Title Suggestion: "${extracted.title}: A ${profile} Initiative"`);
     }
     const similarPapers = [];
     if (bestMatchSimilarity > 0.1) {
@@ -416,10 +450,19 @@ async function analyzeProposal(extracted) {
         keywords.push("High-Budget");
     if (extracted.duration > 24)
         keywords.push("Long-Term");
+    const finalScore = isNaN(score) ? 50 : Math.min(100, Math.max(0, score));
+    (0, ai_debug_1.analyzeLog)("AI:result", {
+        complianceScore: finalScore,
+        complianceScoreSource,
+        isValid: issues.length === 0,
+        issuesCount: issues.length,
+        suggestionsCount: suggestions.length,
+        keywords,
+    });
     // Format valid properties strictly correctly.
     return {
         title: extracted.title,
-        score: isNaN(score) ? 50 : Math.min(100, Math.max(0, score)),
+        score: finalScore,
         isValid: issues.length === 0,
         noveltyScore: isNaN(noveltyScore) ? 100 : Math.min(100, Math.max(0, noveltyScore)),
         keywords,

@@ -2,6 +2,7 @@ import path from "path";
 import { readFileSync, existsSync } from "fs";
 import { execFile } from "child_process";
 import util from "util";
+import { analyzeDebug, analyzeLog, truncateForLog } from "../ai-debug";
 
 const execFileAsync = util.promisify(execFile);
 
@@ -173,6 +174,37 @@ function classify(scaledMeta: number[]): string {
   }
 
   return kmeans.descriptions[String(bestCluster)] ?? "Unknown";
+}
+
+/**
+ * When the Python Keras predictor is unavailable or errors, derive compliance 0–100
+ * from budget/duration/co-agency signals instead of a hardcoded 65.
+ */
+function heuristicComplianceScore(extracted: ExtractedData, profile: string): number {
+  let s = 72;
+
+  const dur = extracted.duration;
+  if (dur >= 6 && dur <= 36) s += 8;
+  else if (dur < 6) s -= 18;
+  else if (dur > 48) s -= 6;
+
+  const total = extracted.total;
+  if (total > 0 && extracted.ps > 0) {
+    const psRatio = extracted.ps / total;
+    if (psRatio > 0.6) s -= 22;
+    else if (psRatio > 0.45) s -= 8;
+    else s += 4;
+  }
+
+  if (extracted.cooperating_agencies >= 2) s += 6;
+  else if (extracted.cooperating_agencies === 1) s += 3;
+
+  if (profile === "Large-Scale Collaborative Grant") s += 4;
+  if (profile.includes("High-Salary") || profile.includes("Overhead")) s -= 5;
+
+  if (total <= 0 && dur <= 0) s -= 15;
+
+  return Math.min(100, Math.max(25, Math.round(s)));
 }
 
 function getTermFrequencies(words: string[]): Record<string, number> {
@@ -349,12 +381,30 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
     extracted.cooperating_agencies,
   ];
   const scaledMeta = scaleMetadata(rawMeta);
+  const profile = classify(scaledMeta);
 
-  // Call python script for accurate semantic encoding and keras model prediction
-  let score = 65;
+  analyzeLog("AI:inputs", {
+    titleLen: extracted.title.length,
+    duration: extracted.duration,
+    total: extracted.total,
+    ps: extracted.ps,
+    mooe: extracted.mooe,
+    co: extracted.co,
+    cooperating_agencies: extracted.cooperating_agencies,
+    profile,
+  });
+  analyzeDebug("AI:scaledMeta", { scaledMeta });
+  analyzeDebug("AI:title preview", { title: truncateForLog(extracted.title, 200) });
+
+  // Optional: Python Keras + sentence-transformers (often missing on VPS → use heuristic below).
+  let score: number | undefined;
+  let complianceScoreSource: "python-keras" | "heuristic" = "heuristic";
+  const pyPath = path.resolve(process.cwd(), "trained-ai", "predict_score.py");
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
+  analyzeDebug("AI:python", { pyPath, pythonCmd, cwd: process.cwd() });
+
   try {
-    const pyPath = path.resolve(process.cwd(), "trained-ai", "predict_score.py");
-    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+    const tPy = Date.now();
     const { stdout, stderr } = await execFileAsync(pythonCmd, [
       pyPath,
       extracted.title,
@@ -368,23 +418,37 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
 
     if (stderr) {
       console.warn("[AI] Python Stderr:", stderr);
+      analyzeDebug("AI:python stderr", { stderr: truncateForLog(String(stderr), 500) });
     }
-    const result = JSON.parse(stdout);
-    if (result.score !== undefined) {
+    const result = JSON.parse(stdout.trim()) as { score?: number; error?: string };
+    analyzeDebug("AI:python stdout", { raw: truncateForLog(stdout.trim(), 500) });
+    if (typeof result.score === "number" && !Number.isNaN(result.score) && result.error == null) {
       score = result.score;
-    } else {
-      console.warn("Python prediction returned error:", result.error);
+      complianceScoreSource = "python-keras";
+      analyzeLog("AI:python scorer ok", { ms: Date.now() - tPy, score: result.score });
+    } else if (result.error) {
+      console.warn("[AI] Python scorer error (using heuristic compliance score):", result.error);
+      analyzeLog("AI:python scorer error", { ms: Date.now() - tPy, error: truncateForLog(result.error, 300) });
     }
   } catch (err: any) {
     console.error("[AI] Python prediction failed. Possible reasons: Python3 not installed, missing libraries (tensorflow, sentence-transformers, joblib), or wrong file paths.");
     console.error("[AI] Error Details:", err.message || err);
+    analyzeLog("AI:python exec failed", { message: err?.message || String(err) });
   }
 
-  // Cluster profile
-  const profile = classify(scaledMeta);
+  if (score === undefined) {
+    score = heuristicComplianceScore(extracted, profile);
+    complianceScoreSource = "heuristic";
+    analyzeLog("AI:compliance heuristic", { score });
+  }
 
   // Novelty / uniqueness check (cosine similarity against NSF CSV)
   const { noveltyScore, bestMatchTitle, bestMatchSimilarity } = checkUniqueness(extracted.title);
+  analyzeLog("AI:novelty", {
+    noveltyScore,
+    bestMatchSimilarity: Math.round(bestMatchSimilarity * 1000) / 1000,
+    bestMatchTitle: truncateForLog(bestMatchTitle, 120),
+  });
 
   const issues: string[] = [];
   const suggestions: string[] = [];
@@ -454,10 +518,20 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   if (extracted.total > 5000000) keywords.push("High-Budget");
   if (extracted.duration > 24) keywords.push("Long-Term");
 
+  const finalScore = isNaN(score!) ? 50 : Math.min(100, Math.max(0, score!));
+  analyzeLog("AI:result", {
+    complianceScore: finalScore,
+    complianceScoreSource,
+    isValid: issues.length === 0,
+    issuesCount: issues.length,
+    suggestionsCount: suggestions.length,
+    keywords,
+  });
+
   // Format valid properties strictly correctly.
   return {
     title: extracted.title,
-    score: isNaN(score) ? 50 : Math.min(100, Math.max(0, score)),
+    score: finalScore,
     isValid: issues.length === 0,
     noveltyScore: isNaN(noveltyScore) ? 100 : Math.min(100, Math.max(0, noveltyScore)),
     keywords,

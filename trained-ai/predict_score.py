@@ -32,4 +32,5 @@ try:
 
     print(json.dumps({"score": int(score)}))
 except Exception as e:
-    print(json.dumps({"error": str(e), "score": 65}))
+    # Do not send a fake score — let the API use its heuristic fallback when `score` is absent.
+    print(json.dumps({"error": str(e)}))
