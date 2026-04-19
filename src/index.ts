@@ -10,7 +10,7 @@ import {
   SUPPORTED_TYPES 
 } from "./services/document-extractor.service";
 import { analyzeLog, isAiDebug } from "./ai-debug";
-// hello
+// hello hello
 dotenv.config();
 
 const app = express();
