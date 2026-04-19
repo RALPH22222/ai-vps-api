@@ -404,8 +404,18 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   let score: number | undefined;
   let complianceScoreSource: "python-keras" | "heuristic" = "heuristic";
   const pyPath = path.resolve(process.cwd(), "trained-ai", "predict_score.py");
-  const pythonCmd = process.platform === "win32" ? "python" : "python3";
-  analyzeDebug("AI:python", { pyPath, pythonCmd, cwd: process.cwd() });
+  let pythonCmd = process.platform === "win32" ? "python" : "python3";
+  
+  // PEP 668 Fix: Use local virtual environment if it exists
+  const venvPath = process.platform === "win32"
+    ? path.join(process.cwd(), "venv", "Scripts", "python.exe")
+    : path.join(process.cwd(), "venv", "bin", "python3");
+
+  if (existsSync(venvPath)) {
+    pythonCmd = venvPath;
+  }
+
+  analyzeDebug("AI:python", { pyPath, pythonCmd, cwd: process.cwd(), usingVenv: existsSync(venvPath) });
 
   try {
     const tPy = Date.now();
