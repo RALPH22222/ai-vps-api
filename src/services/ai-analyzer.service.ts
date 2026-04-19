@@ -31,6 +31,7 @@ export interface AnalysisResult {
   similarPapers: { title: string; year: string }[];
   issues: string[];
   suggestions: string[];
+  strengths: string[];
 }
 
 export interface ExtractedData {
@@ -307,6 +308,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
         "Check that the PDF contains extractable text (not just images)",
         "Verify all required fields are filled in the template"
       ],
+      strengths: [],
     };
   }
 
@@ -341,6 +343,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
         "Verify the document is not password-protected or encrypted",
         "Check that the file is not corrupted"
       ],
+      strengths: [],
     };
   }
 
@@ -367,6 +370,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
         "Check if the PDF text extraction was successful",
         "Verify the document structure and formatting"
       ],
+      strengths: [],
     };
   }
 
@@ -452,6 +456,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
 
   const issues: string[] = [];
   const suggestions: string[] = [];
+  const strengths: string[] = [];
 
   const similarityPct = Math.round(bestMatchSimilarity * 100);
   let simStatus = "";
@@ -462,48 +467,58 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   else simStatus = "Very Similar / Duplicate";
 
   if (similarityPct > 60) {
-    issues.push(`This proposal is ${simStatus} (${similarityPct}%) to an existing project: "${bestMatchTitle}".`);
+    issues.push(`[Similarity] This proposal is ${simStatus} (${similarityPct}%) to an existing project: "${bestMatchTitle}". Consider differentiating your methodology.`);
   } else if (similarityPct > 20) {
-    suggestions.push(`Semantic check: This project is ${simStatus} (${similarityPct}%) to "${bestMatchTitle}".`);
+    suggestions.push(`[Novelty] Semantic check: This project is ${simStatus} (${similarityPct}%) to "${bestMatchTitle}". Highlight your unique approach.`);
+  } else {
+    strengths.push(`[Innovation] High novelty detected. Your project shows minimal overlap with existing research in our database.`);
   }
 
   if (extracted.total > 2000000 && extracted.duration < 12) {
-    issues.push(`Budget intensity is high (PHP ${Math.round(extracted.total/1000000)}M for only ${extracted.duration} months). This may raise feasibility concerns during review.`);
+    issues.push(`[Budget] High budget intensity (PHP ${Math.round(extracted.total/1000000)}M for ${extracted.duration} months). Ensure every expense is deeply justified.`);
   } else if (extracted.total < 500000 && extracted.duration > 24) {
-    suggestions.push(`Budget may be too low (PHP ${extracted.total}) to sustain a long ${extracted.duration}-month research timeline.`);
+    suggestions.push(`[Sustainability] Budget might be too lean (PHP ${extracted.total}) for a long ${extracted.duration}-month timeline. Check for funding gaps.`);
+  } else if (extracted.total > 0) {
+    strengths.push(`[Budget] The proposed budget of PHP ${extracted.total.toLocaleString()} appears well-distributed for the ${extracted.duration}-month timeline.`);
   }
 
   if (extracted.total > 0 && extracted.ps > extracted.total * 0.6) {
     const psPct = Math.round((extracted.ps / extracted.total) * 100);
-    issues.push(`Personal Services (PS) budget is ${psPct}% of total (exceeds DOST's 60% recommended overhead threshold).`);
+    issues.push(`[Overhead] Personal Services (PS) is ${psPct}% of total budget. DOST typically recommends staying below 60%.`);
   } else if (extracted.total > 0 && extracted.ps > extracted.total * 0.45) {
     const psPct = Math.round((extracted.ps / extracted.total) * 100);
-    suggestions.push(`PS budget is ${psPct}% (approaching threshold). Ensure all roles are clearly justified.`);
+    suggestions.push(`[Allocation] PS budget is ${psPct}%. This is within limits but may be scrutinized for efficiency.`);
+  } else if (extracted.total > 0) {
+    strengths.push(`[Efficiency] Excellent PS allocation (${Math.round((extracted.ps/extracted.total)*100)}%). Most of the budget is directed toward MOOE and equipment.`);
   }
 
   if (extracted.duration < 6) {
-    issues.push(`Project duration is too short (${extracted.duration} months). Minimum recommended for R&D is 6 months.`);
+    issues.push(`[Timeline] Duration is too short (${extracted.duration} months). Standard R&D cycles usually require at least 6 months.`);
   } else if (extracted.duration > 36) {
-    suggestions.push(`Project duration exceeds 3 years (${extracted.duration} months). Ensure long-term deliverables are clear.`);
+    suggestions.push(`[Scope] 3-year+ timeline detected. Ensure the phased deliverables are very clearly defined to maintain momentum.`);
+  } else {
+    strengths.push(`[Timeline] The ${extracted.duration}-month project cycle is ideal for the proposed R&D scope.`);
   }
 
   if (extracted.cooperating_agencies === 0) {
-    suggestions.push("No cooperating agencies detected. Feasibility is better demonstrated through institutional partnerships.");
+    suggestions.push("[Collaboration] No cooperating agencies detected. Adding institutional partners can significantly boost feasibility scores.");
+  } else {
+    strengths.push(`[Partnership] Collaboration with ${extracted.cooperating_agencies} agencies demonstrates strong institutional support.`);
   }
 
   const titleLower = extracted.title.toLowerCase();
   if (titleLower.includes("purchase") || titleLower.includes("procurement")) {
-    issues.push("Feasibility alert: Proposal sounds more like a procurement request than a scientific research project.");
+    issues.push("[Focus] Proposal sounds like a procurement request. R&D grants focus on knowledge generation, not just buying equipment.");
     
     // Generate a better sounding title
     const replacedTitle = extracted.title.replace(/purchase of|procurement of/gi, "Integration of").replace(/purchase|procurement/gi, "Development");
-    suggestions.push(`Title Suggestion: "${replacedTitle} for Institutional Advancement" (Shift focus from buying to researching)`);
+    suggestions.push(`[Title] Suggestion: "${replacedTitle} for Institutional Advancement" (Shift focus from buying to researching)`);
   } else if (extracted.title.length > 5 && extracted.title.length < 40) {
-    // If the title is too short, suggest a more academic phrasing
-    suggestions.push(`Title Suggestion: "Comprehensive Study and Optimization of ${extracted.title}"`);
+    suggestions.push(`[Title] Suggestion: "Comprehensive Study and Optimization of ${extracted.title}" (Make it sound more academic)`);
   } else if (profile !== "Standard R&D Project" && profile !== "Unknown") {
-    // Suggest adding the profile to the title if it's unique
-    suggestions.push(`Title Suggestion: "${extracted.title}: A ${profile} Initiative"`);
+    suggestions.push(`[Title] Suggestion: "${extracted.title}: A ${profile} Initiative"`);
+  } else {
+    strengths.push("[Title] Your project title is descriptive and follows academic standards.");
   }
 
   const similarPapers: { title: string; year: string }[] = [];
@@ -538,5 +553,6 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
     similarPapers,
     issues,
     suggestions,
+    strengths,
   };
 }
