@@ -439,8 +439,18 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
     });
 
     if (stderr) {
-      console.warn("[AI] Python Stderr:", stderr);
-      analyzeDebug("AI:python stderr", { stderr: truncateForLog(String(stderr), 500) });
+      // Filter out the noisy TensorFlow/absl initialization logs that ignore env variables
+      const cleanStderr = stderr.split('\n').filter(line => 
+        !line.includes('absl::InitializeLog') && 
+        !line.includes('oneDNN') && 
+        !line.includes('cudart_stub') && 
+        line.trim().length > 0
+      ).join('\n');
+
+      if (cleanStderr) {
+        console.warn("[AI] Python Stderr:", cleanStderr);
+        analyzeDebug("AI:python stderr", { stderr: truncateForLog(String(cleanStderr), 500) });
+      }
     }
     const result = JSON.parse(stdout.trim()) as { score?: number; error?: string; metrics?: any };
     analyzeDebug("AI:python stdout", { raw: truncateForLog(stdout.trim(), 500) });
