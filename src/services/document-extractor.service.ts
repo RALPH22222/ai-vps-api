@@ -433,43 +433,55 @@ export function extractFormFields(text: string): FormExtractedFields {
     delete fields.agency_name;
   }
 
-  const priorityAreas = readLabeledValue(
-    [
-      /^Priority\s+Areas?[:\s]*(.*)$/i, 
-      /^Priority\s+Area\(s\)[:\s]*(.*)$/i,
-      /^Priority\s+Area[:\s]*(.*)$/i,
-      /^STAND\s+Classification[:\s]*(.*)$/i,
-      /^STAND\s+Priority\s+Area[:\s]*(.*)$/i,
-      /^S\s*T\s*A\s*N\s*D\s+Classification[:\s]*(.*)$/i, // Handle OCR spaces
-    ],
-    [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i, /^R\s*&\s*D/i]
-  );
-  if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
-    // 1. Split the line into parts (to handle columns in the PDF)
-    // 2. Filter out parts that are just underscores or empty
-    const parts = priorityAreas.split(/_{2,}|\s{2,}/).map(p => p.trim()).filter(p => p.length > 2);
-    
-    // 3. Re-join the actual text found
-    const cleanedValue = parts
-      .map(p => p.replace(/^[\s_xX✓✔-]+/g, "").replace(/\bSTAND\b/gi, "").trim())
-      .filter(Boolean)
-      .join(", ");
-
-    fields.priority_areas = cleanedValue;
-    fields.stand_classification = cleanedValue;
+  // --- Priority Areas / STAND Classification ---
+  // The PDF has a section header "(6) Priority Areas/STAND Classification" with
+  // checkbox options on the FOLLOWING lines. We scan those lines for a filled
+  // checkbox (non-underscore prefix like a flag icon or filled mark).
+  {
+    const sectionIdx = lines.findIndex(l => /Priority\s+Areas?\s*\/\s*STAND\s+Classification/i.test(l));
+    if (sectionIdx !== -1) {
+      // The known options in the DOST template
+      const knownOptions = [
+        "STAND",
+        "Coconut Industry",
+        "Export Winners",
+        "Other Priority Areas",
+        "Support Industries",
+      ];
+      const checkedOptions: string[] = [];
+      // Scan the next 6 lines for any filled/checked option
+      for (let i = sectionIdx + 1; i < Math.min(sectionIdx + 7, lines.length); i++) {
+        const rawLine = lines[i];
+        
+        for (const opt of knownOptions) {
+          // Find where the option text starts in the line
+          const idx = rawLine.indexOf(opt);
+          if (idx !== -1) {
+            // Grab the ~12 characters right before the option
+            const prefix = rawLine.substring(Math.max(0, idx - 12), idx);
+            // Check if those characters contain a checkmark (x, X, ✓, ✔, or the unicode )
+            // surrounded by spaces, brackets, or underscores
+            const isChecked = /[\s_\[\]()]*[xX✓✔][\s_\[\]()]*$/.test(prefix);
+            
+            if (isChecked) {
+              checkedOptions.push(opt);
+            }
+          }
+        }
+      }
+      if (checkedOptions.length > 0) {
+        const finalValue = checkedOptions.join(", ");
+        fields.priority_areas = finalValue;
+        fields.stand_classification = finalValue;
+      }
+    }
   }
 
   if (!fields.priority_areas && fields.sector) {
     fields.priority_areas = fields.sector;
   }
-
-  // Specific fallback for STAND if not found in priority areas
-  if (!fields.stand_classification) {
-    const standMatch = textForScan.match(/STAND\s+(?:Classification|Priority|Area)[:\s]*([^\n\r]+)/i);
-    if (standMatch?.[1]) {
-      fields.stand_classification = clean(standMatch[1]);
-      if (!fields.priority_areas) fields.priority_areas = fields.stand_classification;
-    }
+  if (!fields.stand_classification && fields.priority_areas) {
+    fields.stand_classification = fields.priority_areas;
   }
 
   const coopMatch = textForScan.match(/Cooperating\s+Agenc(?:y|ies)[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|\n\s*R\s*&\s*D\s+Station|$)/i);

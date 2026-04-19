@@ -387,31 +387,52 @@ function extractFormFields(text) {
     if (fields.agency_name !== undefined && !String(fields.agency_name).trim()) {
         delete fields.agency_name;
     }
-    const priorityAreas = readLabeledValue([
-        /^Priority\s+Areas?[:\s]*(.*)$/i,
-        /^Priority\s+Area\(s\)[:\s]*(.*)$/i,
-        /^Priority\s+Area[:\s]*(.*)$/i,
-        /^STAND\s+Classification[:\s]*(.*)$/i,
-        /^STAND\s+Priority\s+Area[:\s]*(.*)$/i,
-        /^S\s*T\s*A\s*N\s*D\s+Classification[:\s]*(.*)$/i, // Handle OCR spaces
-    ], [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i, /^R\s*&\s*D/i]);
-    if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
-        fields.priority_areas = priorityAreas;
-        if (/STAND/i.test(priorityAreas) || textForScan.toLowerCase().includes("stand classification")) {
-            fields.stand_classification = priorityAreas;
+    // --- Priority Areas / STAND Classification ---
+    // The PDF has a section header "(6) Priority Areas/STAND Classification" with
+    // checkbox options on the FOLLOWING lines. We scan those lines for a filled
+    // checkbox (non-underscore prefix like a flag icon or filled mark).
+    {
+        const sectionIdx = lines.findIndex(l => /Priority\s+Areas?\s*\/\s*STAND\s+Classification/i.test(l));
+        if (sectionIdx !== -1) {
+            // The known options in the DOST template
+            const knownOptions = [
+                "STAND",
+                "Coconut Industry",
+                "Export Winners",
+                "Other Priority Areas",
+                "Support Industries",
+            ];
+            const checkedOptions = [];
+            // Scan the next 6 lines for any filled/checked option
+            for (let i = sectionIdx + 1; i < Math.min(sectionIdx + 7, lines.length); i++) {
+                const rawLine = lines[i];
+                for (const opt of knownOptions) {
+                    // Find where the option text starts in the line
+                    const idx = rawLine.indexOf(opt);
+                    if (idx !== -1) {
+                        // Grab the ~12 characters right before the option
+                        const prefix = rawLine.substring(Math.max(0, idx - 12), idx);
+                        // Check if those characters contain a checkmark (x, X, ✓, ✔, or the unicode )
+                        // surrounded by spaces, brackets, or underscores
+                        const isChecked = /[\s_\[\]()]*[xX✓✔][\s_\[\]()]*$/.test(prefix);
+                        if (isChecked) {
+                            checkedOptions.push(opt);
+                        }
+                    }
+                }
+            }
+            if (checkedOptions.length > 0) {
+                const finalValue = checkedOptions.join(", ");
+                fields.priority_areas = finalValue;
+                fields.stand_classification = finalValue;
+            }
         }
     }
     if (!fields.priority_areas && fields.sector) {
         fields.priority_areas = fields.sector;
     }
-    // Specific fallback for STAND if not found in priority areas
-    if (!fields.stand_classification) {
-        const standMatch = textForScan.match(/STAND\s+(?:Classification|Priority|Area)[:\s]*([^\n\r]+)/i);
-        if (standMatch?.[1]) {
-            fields.stand_classification = clean(standMatch[1]);
-            if (!fields.priority_areas)
-                fields.priority_areas = fields.stand_classification;
-        }
+    if (!fields.stand_classification && fields.priority_areas) {
+        fields.stand_classification = fields.priority_areas;
     }
     const coopMatch = textForScan.match(/Cooperating\s+Agenc(?:y|ies)[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|\n\s*R\s*&\s*D\s+Station|$)/i);
     if (coopMatch) {
@@ -495,7 +516,7 @@ function extractFormFields(text) {
         fields.planned_end_year = endMatch[2].trim();
     }
     if (!fields.year) {
-        fields.year = fields.planned_start_year || fields.planned_end_year;
+        fields.year = new Date().getFullYear().toString();
     }
     const budgetSection = textForScan.match(/(?:Estimated\s+Budget|Source\s*\n?\s*Of\s+funds)([\s\S]*?)(?=Note:|$)/i);
     if (budgetSection) {

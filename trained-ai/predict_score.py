@@ -5,6 +5,7 @@ import warnings
 
 # Suppress ALL noise before heavy imports
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ABSL_LOGGING_MIN_LOG_LEVEL'] = '3'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Force CPU mode (stops CUDA errors)
 warnings.filterwarnings("ignore")
 

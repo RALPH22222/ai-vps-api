@@ -432,6 +432,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
       env: {
         ...process.env,
         TF_CPP_MIN_LOG_LEVEL: "3",
+        ABSL_LOGGING_MIN_LOG_LEVEL: "3",
         CUDA_VISIBLE_DEVICES: "-1",
         PYTHONIOENCODING: "utf8"
       }
