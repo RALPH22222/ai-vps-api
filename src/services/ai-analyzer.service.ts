@@ -428,7 +428,14 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
       String(extracted.co),
       String(extracted.total),
       String(extracted.cooperating_agencies)
-    ]);
+    ], {
+      env: {
+        ...process.env,
+        TF_CPP_MIN_LOG_LEVEL: "3",
+        CUDA_VISIBLE_DEVICES: "-1",
+        PYTHONIOENCODING: "utf8"
+      }
+    });
 
     if (stderr) {
       console.warn("[AI] Python Stderr:", stderr);
@@ -547,7 +554,15 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   if (extracted.total > 5000000) keywords.push("High-Budget");
   if (extracted.duration > 24) keywords.push("Long-Term");
 
-  const finalScore = isNaN(score!) ? 50 : Math.min(100, Math.max(0, score!));
+  let finalScore = isNaN(score!) ? 50 : Math.min(100, Math.max(0, score!));
+
+  // Realistic Adjustment: Decrease score based on issues and suggestions
+  if (finalScore > 40) {
+    finalScore -= (issues.length * 5);      // -5% for each critical issue
+    finalScore -= (suggestions.length * 2); // -2% for each suggestion
+  }
+  finalScore = Math.max(15, Math.min(100, finalScore));
+
   analyzeLog("AI:result", {
     complianceScore: finalScore,
     complianceScoreSource,
