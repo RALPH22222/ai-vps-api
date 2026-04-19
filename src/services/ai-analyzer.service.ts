@@ -434,12 +434,16 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
       console.warn("[AI] Python Stderr:", stderr);
       analyzeDebug("AI:python stderr", { stderr: truncateForLog(String(stderr), 500) });
     }
-    const result = JSON.parse(stdout.trim()) as { score?: number; error?: string };
+    const result = JSON.parse(stdout.trim()) as { score?: number; error?: string; metrics?: any };
     analyzeDebug("AI:python stdout", { raw: truncateForLog(stdout.trim(), 500) });
     if (typeof result.score === "number" && !Number.isNaN(result.score) && result.error == null) {
       score = result.score;
       complianceScoreSource = "python-keras";
-      analyzeLog("AI:python scorer ok", { ms: Date.now() - tPy, score: result.score });
+      analyzeLog("AI:python scorer ok", { 
+        ms: Date.now() - tPy, 
+        score: result.score,
+        metrics: result.metrics // Log the new internal metrics from Python
+      });
     } else if (result.error) {
       console.warn("[AI] Python scorer error (using heuristic compliance score):", result.error);
       analyzeLog("AI:python scorer error", { ms: Date.now() - tPy, error: truncateForLog(result.error, 300) });

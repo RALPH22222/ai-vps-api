@@ -8,6 +8,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Force CPU mode (stops CUDA errors)
 warnings.filterwarnings("ignore")
 
+# Redirect stderr to devnull to stop the "Unexpected" and "Warning" noise on VPS
+sys.stderr = open(os.devnull, 'w')
+
 try:
     # Heavy imports inside try to catch any missing dependency issues
     import tensorflow as tf
@@ -40,9 +43,21 @@ try:
     stats = scaler.transform([[duration, mooe, ps, co, total, agencies]])
 
     # Predict
-    score = model.predict({'emb_input': title_vec, 'meta_input': stats}, verbose=0)[0][0] * 100
+    raw_pred = model.predict({'emb_input': title_vec, 'meta_input': stats}, verbose=0)[0][0]
+    score = round(float(raw_pred) * 100)
+    
+    # Cap between 0 and 100
+    final_score = max(0, min(100, score))
 
-    print(json.dumps({"score": int(score)}))
+    # Detailed report for the Node.js logs
+    print(json.dumps({
+        "score": final_score,
+        "metrics": {
+            "title_vec_mean": float(title_vec.mean()),
+            "meta_stats_sum": float(stats.sum()),
+            "raw_output": float(raw_pred)
+        }
+    }))
 except Exception as e:
     # Do not send a fake score — let the API use its heuristic fallback when `score` is absent.
     print(json.dumps({"error": str(e)}))
