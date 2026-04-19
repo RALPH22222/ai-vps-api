@@ -445,10 +445,18 @@ export function extractFormFields(text: string): FormExtractedFields {
     [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i, /^R\s*&\s*D/i]
   );
   if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
-    fields.priority_areas = priorityAreas;
-    if (/STAND/i.test(priorityAreas) || textForScan.toLowerCase().includes("stand classification")) {
-       fields.stand_classification = priorityAreas;
-    }
+    // 1. Split the line into parts (to handle columns in the PDF)
+    // 2. Filter out parts that are just underscores or empty
+    const parts = priorityAreas.split(/_{2,}|\s{2,}/).map(p => p.trim()).filter(p => p.length > 2);
+    
+    // 3. Re-join the actual text found
+    const cleanedValue = parts
+      .map(p => p.replace(/^[\s_xX✓✔-]+/g, "").replace(/\bSTAND\b/gi, "").trim())
+      .filter(Boolean)
+      .join(", ");
+
+    fields.priority_areas = cleanedValue;
+    fields.stand_classification = cleanedValue;
   }
 
   if (!fields.priority_areas && fields.sector) {
