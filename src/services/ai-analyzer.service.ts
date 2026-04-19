@@ -6,7 +6,7 @@ import { analyzeDebug, analyzeLog, truncateForLog } from "../ai-debug";
 
 const execFileAsync = util.promisify(execFile);
 
-// ── Types ────────────────────────────────────────────────────────────
+// ── Types ───────────────────────────────────────────────────────────
 
 interface ScalerParams {
   mean: number[];
