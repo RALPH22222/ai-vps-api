@@ -181,10 +181,13 @@ function extractDataFromText(text) {
  */
 function extractAgencyAddressBlobFromFullText(fullText) {
     const patterns = [
-        /Agency\s*\/\s*Agency\s+Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email)\b)/i,
-        /Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email)\b)/i,
+        /Agency\s*\/\s*Agency\s+Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email|Leader\b|Program\b|Project\b|Gender\b))/i,
+        /Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email|Leader\b|Program\b|Project\b|Gender\b))/i,
+        /Implementing\s+Agency\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Address|Telephone|Leader\b))/i,
         /Agency\s*\/\s*(?:Agency\s+)?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*Leader\s*\/\s*Gender\b)/i,
         /Agency\s*\/\s*(?:Agency\s+)?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*\(\d+\)\s*[^\s])/i,
+        /Implementing\s+Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone|Leader\b))/i,
+        /Implementing\s+Agency\b[\s\S]*?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone|Leader\b))/i,
     ];
     for (const p of patterns) {
         const m = fullText.match(p);
@@ -236,15 +239,23 @@ function extractFormFields(text) {
         /Program\s+Title/i.test(s) ||
         /Project\s+Title/i.test(s);
     const readLabeledValue = (labelPatterns, stopPatterns = []) => {
-        for (const line of lines) {
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
             for (const labelPattern of labelPatterns) {
                 const match = line.match(labelPattern);
                 if (!match)
                     continue;
                 let value = clean(match[1] || "");
+                // If value is empty on this line, try the next line
+                if (!value && i + 1 < lines.length) {
+                    const next = lines[i + 1];
+                    // Ensure next line isn't another label
+                    if (!/^(Program|Project|Leader|Agency|Address|Telephone|Fax|Email|Priority|Sector|Discipline|Duration|Classification)/i.test(next)) {
+                        value = clean(next);
+                    }
+                }
                 if (!value)
                     continue;
-                // Some PDF extracts concatenate the next label into the same line.
                 // Trim value when a known stop marker starts.
                 for (const stop of stopPatterns) {
                     const stopMatch = value.match(stop);
@@ -318,11 +329,17 @@ function extractFormFields(text) {
         applyAgencyFromRaw(agencyBlob);
     }
     if (!fields.agency_name) {
+        const agencyName = readLabeledValue([/^Implementing\s+Agency[:\s]*(.*)$/i, /^Agency\s+Name[:\s]*(.*)$/i, /^Agency[:\s]*(.*)$/i], [/Address/i, /Telephone/i, /Program/i, /Project/i]);
+        if (agencyName)
+            fields.agency_name = agencyName;
+    }
+    if (!fields.agency_city && !fields.agency_street) {
         const agencyAddress = readLabeledValue([
             /^Agency\s*\/\s*Agency\s+Address[:\s]*(.*)$/i,
             /^Agency\s*\/\s*Address[:\s]*(.*)$/i,
             /^Agency\s+Address[:\s]*(.*)$/i,
-        ], [/Telephone\s*\/\s*Fax\s*\/\s*Email/i, /Program\s+Title\s*:/i, /Project\s+Title\s*:/i]);
+            /^Address[:\s]*(.*)$/i,
+        ], [/Telephone\s*\/\s*Fax\s*\/\s*Email/i, /Program\s+Title\s*:/i, /Project\s+Title\s*:/i, /Leader/i]);
         if (agencyAddress)
             applyAgencyFromRaw(agencyAddress);
     }
@@ -370,9 +387,27 @@ function extractFormFields(text) {
     if (fields.agency_name !== undefined && !String(fields.agency_name).trim()) {
         delete fields.agency_name;
     }
-    const priorityAreas = readLabeledValue([/^Priority\s+Areas?[:\s]*(.*)$/i, /^Priority\s+Area[:\s]*(.*)$/i], [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i]);
+    const priorityAreas = readLabeledValue([
+        /^Priority\s+Areas?[:\s]*(.*)$/i,
+        /^Priority\s+Area[:\s]*(.*)$/i,
+        /^STAND\s+Classification[:\s]*(.*)$/i,
+        /^STAND\s+Priority\s+Area[:\s]*(.*)$/i,
+        /^S\s*T\s*A\s*N\s*D\s+Classification[:\s]*(.*)$/i, // Handle OCR spaces
+    ], [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i, /^R\s*&\s*D/i]);
     if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
         fields.priority_areas = priorityAreas;
+        if (/STAND/i.test(priorityAreas) || textForScan.toLowerCase().includes("stand classification")) {
+            fields.stand_classification = priorityAreas;
+        }
+    }
+    // Specific fallback for STAND if not found in priority areas
+    if (!fields.stand_classification) {
+        const standMatch = textForScan.match(/STAND\s+(?:Classification|Priority|Area)[:\s]*([^\n\r]+)/i);
+        if (standMatch?.[1]) {
+            fields.stand_classification = clean(standMatch[1]);
+            if (!fields.priority_areas)
+                fields.priority_areas = fields.stand_classification;
+        }
     }
     const coopMatch = textForScan.match(/Cooperating\s+Agenc(?:y|ies)[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|\n\s*R\s*&\s*D\s+Station|$)/i);
     if (coopMatch) {

@@ -207,11 +207,13 @@ export function extractDataFromText(text: string): ExtractedData {
  */
 function extractAgencyAddressBlobFromFullText(fullText: string): string | undefined {
   const patterns: RegExp[] = [
-    /Agency\s*\/\s*Agency\s+Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email|Leader\b|Program\b|Project\b))/i,
-    /Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email|Leader\b|Program\b|Project\b))/i,
+    /Agency\s*\/\s*Agency\s+Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email|Leader\b|Program\b|Project\b|Gender\b))/i,
+    /Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone\s*\/\s*Fax\s*\/\s*Email|Telephone\/Fax\/Email|Leader\b|Program\b|Project\b|Gender\b))/i,
     /Implementing\s+Agency\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Address|Telephone|Leader\b))/i,
     /Agency\s*\/\s*(?:Agency\s+)?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*Leader\s*\/\s*Gender\b)/i,
     /Agency\s*\/\s*(?:Agency\s+)?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*\(\d+\)\s*[^\s])/i,
+    /Implementing\s+Agency\s*\/\s*Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone|Leader\b))/i,
+    /Implementing\s+Agency\b[\s\S]*?Address\s*[:\s]*\s*([\s\S]+?)(?=\s*(?:Telephone|Leader\b))/i,
   ];
   for (const p of patterns) {
     const m = fullText.match(p);
@@ -273,15 +275,25 @@ export function extractFormFields(text: string): FormExtractedFields {
     /Project\s+Title/i.test(s);
 
   const readLabeledValue = (labelPatterns: RegExp[], stopPatterns: RegExp[] = []): string | undefined => {
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       for (const labelPattern of labelPatterns) {
         const match = line.match(labelPattern);
         if (!match) continue;
 
         let value = clean(match[1] || "");
+        
+        // If value is empty on this line, try the next line
+        if (!value && i + 1 < lines.length) {
+          const next = lines[i + 1];
+          // Ensure next line isn't another label
+          if (!/^(Program|Project|Leader|Agency|Address|Telephone|Fax|Email|Priority|Sector|Discipline|Duration|Classification)/i.test(next)) {
+            value = clean(next);
+          }
+        }
+
         if (!value) continue;
 
-        // Some PDF extracts concatenate the next label into the same line.
         // Trim value when a known stop marker starts.
         for (const stop of stopPatterns) {
           const stopMatch = value.match(stop);
@@ -426,9 +438,10 @@ export function extractFormFields(text: string): FormExtractedFields {
       /^Priority\s+Areas?[:\s]*(.*)$/i, 
       /^Priority\s+Area[:\s]*(.*)$/i,
       /^STAND\s+Classification[:\s]*(.*)$/i,
-      /^STAND\s+Priority\s+Area[:\s]*(.*)$/i
+      /^STAND\s+Priority\s+Area[:\s]*(.*)$/i,
+      /^S\s*T\s*A\s*N\s*D\s+Classification[:\s]*(.*)$/i, // Handle OCR spaces
     ],
-    [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i]
+    [/Sector\s*\/\s*Commodity/i, /Discipline/i, /\(\d\)/i, /^R\s*&\s*D/i]
   );
   if (priorityAreas && !/^N\/?A$/i.test(priorityAreas)) {
     fields.priority_areas = priorityAreas;
