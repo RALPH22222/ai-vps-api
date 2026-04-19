@@ -189,6 +189,24 @@ export function extractFormFields(text: string): FormExtractedFields {
     .map((line) => line.trim())
     .filter(Boolean);
 
+  /** PDFs often merge the next block label into the same line as agency or contact. */
+  const stripAfterContactLabel = (s: string): string =>
+    clean(s.replace(/\bTelephone\s*\/\s*Fax\s*\/\s*Email\b[\s\S]*/i, ""));
+
+  const isGarbageContactValue = (s: string): boolean =>
+    !s ||
+    /^Telephone\s*\/\s*Fax\s*\/\s*Email$/i.test(s) ||
+    /Program\s+Title/i.test(s) ||
+    /Project\s+Title/i.test(s) ||
+    /^Leader\s*\/\s*Gender/i.test(s);
+
+  const isGarbageAddressSegment = (s: string): boolean =>
+    !s ||
+    /^Telephone/i.test(s) ||
+    /Fax\s*\/\s*Email/i.test(s) ||
+    /Program\s+Title/i.test(s) ||
+    /Project\s+Title/i.test(s);
+
   const readLabeledValue = (labelPatterns: RegExp[], stopPatterns: RegExp[] = []): string | undefined => {
     for (const line of lines) {
       for (const labelPattern of labelPatterns) {
@@ -196,7 +214,7 @@ export function extractFormFields(text: string): FormExtractedFields {
         if (!match) continue;
 
         let value = clean(match[1] || "");
-        if (!value) return undefined;
+        if (!value) continue;
 
         // Some PDF extracts concatenate the next label into the same line.
         // Trim value when a known stop marker starts.
@@ -240,15 +258,25 @@ export function extractFormFields(text: string): FormExtractedFields {
   }
 
   const agencyAddress = readLabeledValue(
-    [/^Agency\s*\/\s*Address[:\s]*(.*)$/i, /^Agency\s+Address[:\s]*(.*)$/i],
+    [
+      /^Agency\s*\/\s*Agency\s+Address[:\s]*(.*)$/i,
+      /^Agency\s*\/\s*Address[:\s]*(.*)$/i,
+      /^Agency\s+Address[:\s]*(.*)$/i,
+    ],
     [/Telephone\s*\/\s*Fax\s*\/\s*Email/i, /Program\s+Title\s*:/i, /Project\s+Title\s*:/i]
   );
   if (agencyAddress) {
-    const raw = clean(agencyAddress);
-    const parts = raw.split(/\s*\/\s*/);
+    let raw = stripAfterContactLabel(clean(agencyAddress));
+    const parts = raw.split(/\s*\/\s*/).map((p) => p.trim()).filter(Boolean);
     if (parts.length >= 2) {
-      fields.agency_name = parts[0].trim();
-      const addrParts = parts.slice(1).join("/").split(",").map(s => s.trim());
+      const name = parts[0].trim();
+      if (name) fields.agency_name = name;
+      const addrParts = parts
+        .slice(1)
+        .join("/")
+        .split(",")
+        .map((s) => s.trim())
+        .filter((p) => p && !isGarbageAddressSegment(p));
       if (addrParts.length >= 3) {
         fields.agency_street = addrParts[0];
         fields.agency_barangay = addrParts[1];
@@ -259,23 +287,30 @@ export function extractFormFields(text: string): FormExtractedFields {
       } else if (addrParts.length === 1) {
         fields.agency_city = addrParts[0];
       }
-    } else {
+    } else if (raw) {
       fields.agency_name = raw;
     }
   }
 
-  const contactLine = readLabeledValue(
-    [/^Telephone\s*\/\s*Fax\s*\/\s*Email[:\s]*(.*)$/i, /^Telephone[:\s]*(.*)$/i],
+  // Strict contact line only — avoid ^Telephone: which matches junk like "Program Title: N/A".
+  let contactLine = readLabeledValue(
+    [/^Telephone\s*\/\s*Fax\s*\/\s*Email[:\s]*(.*)$/i],
     [/Program\s+Title\s*:/i, /Project\s+Title\s*:/i, /Leader\s*\/\s*Gender\s*:/i, /Agency\s*\/\s*Address\s*:/i]
   );
+  if (!contactLine) {
+    const loose = text.match(/Telephone\s*\/\s*Fax\s*\/\s*Email[:\s]*([^\n\r]+)/i);
+    if (loose?.[1]) contactLine = clean(loose[1]);
+  }
   if (contactLine) {
     const raw = clean(contactLine);
-    const emailInLine = raw.match(/[\w.+-]+@[\w.-]+\.\w+/);
-    if (emailInLine) fields.email = emailInLine[0];
-    const phoneInLine = raw.match(/[\d()+\-\s]{7,}/);
-    if (phoneInLine) fields.telephone = phoneInLine[0].trim();
-    if (!fields.email && !fields.telephone && raw.length > 3) {
-      fields.telephone = raw;
+    if (!isGarbageContactValue(raw)) {
+      const emailInLine = raw.match(/[\w.+-]+@[\w.-]+\.\w+/);
+      if (emailInLine) fields.email = emailInLine[0];
+      const phoneInLine = raw.match(/[\d()+\-\s]{7,}/);
+      if (phoneInLine) fields.telephone = phoneInLine[0].trim();
+      if (!fields.email && !fields.telephone && raw.length > 3 && !isGarbageContactValue(raw)) {
+        fields.telephone = raw;
+      }
     }
   }
 
@@ -285,8 +320,20 @@ export function extractFormFields(text: string): FormExtractedFields {
     if (emailFallback) fields.email = emailFallback[0];
   }
 
-  if (fields.telephone && /Program\s+Title/i.test(fields.telephone)) {
-    fields.telephone = undefined;
+  if (fields.telephone && isGarbageContactValue(fields.telephone)) {
+    delete fields.telephone;
+  }
+  if (fields.agency_city && isGarbageAddressSegment(fields.agency_city)) {
+    delete fields.agency_city;
+  }
+  if (fields.agency_street && isGarbageAddressSegment(fields.agency_street)) {
+    delete fields.agency_street;
+  }
+  if (fields.agency_barangay && isGarbageAddressSegment(fields.agency_barangay)) {
+    delete fields.agency_barangay;
+  }
+  if (fields.agency_name !== undefined && !String(fields.agency_name).trim()) {
+    delete fields.agency_name;
   }
 
   const priorityAreas = readLabeledValue(
@@ -325,20 +372,34 @@ export function extractFormFields(text: string): FormExtractedFields {
     else if (hasPromotion) { fields.classification_type = "development"; fields.class_input = "tech_promotion"; }
   }
 
-  const sectorMatch = text.match(/Sector\/Commodity[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
-  if (sectorMatch) {
-    const val = clean(sectorMatch[1]);
-    if (val.length > 2) fields.sector = val;
+  // Same-line PDF extracts often put the value after "Sector/Commodity:" on one line.
+  let sectorVal = readLabeledValue(
+    [/^Sector\s*\/\s*Commodity[:\s]*(.*)$/i],
+    [/^\(\d+\)\s*/, /^Discipline\b/i, /\n\s*Discipline\b/i]
+  );
+  if (!sectorVal) {
+    const sectorLoose = text.match(/Sector\s*\/\s*Commodity[:\s]*([^\n\r]+)/i);
+    if (sectorLoose?.[1]) sectorVal = clean(sectorLoose[1]);
+  }
+  if (sectorVal) {
+    sectorVal = clean(sectorVal.split(/\bDiscipline\b/i)[0] ?? sectorVal);
+    if (sectorVal.length > 2) fields.sector = sectorVal;
   }
 
   if (!fields.sector && fields.priority_areas) {
     fields.sector = fields.priority_areas;
   }
 
-  const discMatch = text.match(/Discipline[^\n]*\n?([\s\S]*?)(?=\n\s*\(\d\)|$)/i);
-  if (discMatch) {
-    const val = clean(discMatch[1]);
-    if (val.length > 2) fields.discipline = val;
+  let disciplineVal = readLabeledValue(
+    [/^Discipline[:\s]*(.*)$/i],
+    [/^\(\d+\)\s*/, /\n\s*\(\d+\)/]
+  );
+  if (!disciplineVal) {
+    const discLoose = text.match(/Discipline[:\s]*([^\n\r]+)/i);
+    if (discLoose?.[1]) disciplineVal = clean(discLoose[1]);
+  }
+  if (disciplineVal && disciplineVal.length > 2) {
+    fields.discipline = disciplineVal;
   }
 
   const monthsMatch = text.match(/\(In\s+months\)\s*(\d+)/i);
