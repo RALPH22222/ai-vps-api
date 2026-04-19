@@ -404,7 +404,7 @@ export async function analyzeProposal(extracted: ExtractedData): Promise<Analysi
   let score: number | undefined;
   let complianceScoreSource: "python-keras" | "heuristic" = "heuristic";
   const pyPath = path.resolve(process.cwd(), "trained-ai", "predict_score.py");
-  let pythonCmd = process.platform === "win32" ? "python" : "python3";
+  let pythonCmd = process.platform === "win32" ? "python" : "python";
   
   // PEP 668 Fix: Use local virtual environment if it exists
   const venvPath = process.platform === "win32"

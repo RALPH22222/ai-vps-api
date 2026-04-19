@@ -336,7 +336,7 @@ async function analyzeProposal(extracted) {
     let score;
     let complianceScoreSource = "heuristic";
     const pyPath = path_1.default.resolve(process.cwd(), "trained-ai", "predict_score.py");
-    let pythonCmd = process.platform === "win32" ? "python" : "python3";
+    let pythonCmd = process.platform === "win32" ? "python" : "python";
     // PEP 668 Fix: Use local virtual environment if it exists
     const venvPath = process.platform === "win32"
         ? path_1.default.join(process.cwd(), "venv", "Scripts", "python.exe")
