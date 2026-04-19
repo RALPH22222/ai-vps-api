@@ -552,7 +552,7 @@ export function extractFormFields(text: string): FormExtractedFields {
   }
 
   if (!fields.year) {
-    fields.year = fields.planned_start_year || fields.planned_end_year;
+    fields.year = new Date().getFullYear().toString();
   }
 
   const budgetSection = textForScan.match(/(?:Estimated\s+Budget|Source\s*\n?\s*Of\s+funds)([\s\S]*?)(?=Note:|$)/i);
